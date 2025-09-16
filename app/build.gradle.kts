@@ -7,6 +7,10 @@ android {
     namespace = "cc.ggrip.movenet"
     compileSdk = 35
 
+    packagingOptions {
+        pickFirst ("lib/**/libtensorflowlite_jni.so")
+    }
+
     defaultConfig {
         applicationId = "cc.ggrip.movenet"
         minSdk = 33
@@ -44,8 +48,11 @@ dependencies {
     implementation("androidx.camera:camera-camera2:1.5.0")
     implementation("androidx.camera:camera-lifecycle:1.5.0")
     implementation("androidx.camera:camera-view:1.5.0")
-// TensorFlow Lite
+    // TensorFlow Lite
     implementation("org.tensorflow:tensorflow-lite:2.17.0")
+    implementation("org.tensorflow:tensorflow-lite-gpu-api:2.17.0")
+
+    // GPU: 플러그인 경로(둘 다 필요)
     implementation("org.tensorflow:tensorflow-lite-gpu:2.17.0")
     implementation("org.tensorflow:tensorflow-lite-support:0.5.0")
 

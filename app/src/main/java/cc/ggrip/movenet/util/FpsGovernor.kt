@@ -12,6 +12,7 @@ class FpsGovernor(targetFps: Double) {
         }
         return false
     }
+
     fun setTargetFps(targetFps: Double) {
         intervalNs = (1_000_000_000.0 / targetFps).toLong()
     }

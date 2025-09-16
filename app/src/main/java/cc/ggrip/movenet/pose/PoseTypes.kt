@@ -3,19 +3,28 @@ package cc.ggrip.movenet.pose
 
 data class PoseFrame(
     val tMillis: Long,
-    val world: FloatArray,      // 33*3 or empty
-    val screen2d: FloatArray,   // Nx2 normalized, N=17(ML) or 33(MP)
+    val world: FloatArray,      // MoveNet은 3D 없음: 빈 배열 사용
+    val screen2d: FloatArray,   // 33*2 (MoveNet은 17*2만 사용)
     val visibility: FloatArray? = null,
 
-    val srcTsMs: Long = -1L,         // camera frame timestamp (ms)
-    val algoDoneTsMs: Long = -1L,    // end of inference (ms)
-
-    // ↓ 벤치마크용 메타
-    val engineName: String = "",
-    val modelTier: String = ""       // LIGHT / MID / HEAVY
+    // 지연 계측용 타임스탬프
+    val srcTsMs: Long = -1L,        // 카메라 프레임 원본 시각
+    val algoDoneTsMs: Long = -1L    // 추론 완료 시각 (onResults/processor.run 이후)
 )
 
 object PoseConst {
-    const val MOVENET_KP = 17
-    const val MEDIAPIPE_KP = 33
+    const val NUM_LM = 33
+    const val NOSE = 0
+    const val LEFT_SHOULDER = 11
+    const val RIGHT_SHOULDER = 12
+    const val LEFT_ELBOW = 13
+    const val RIGHT_ELBOW = 14
+    const val LEFT_WRIST = 15
+    const val RIGHT_WRIST = 16
+    const val LEFT_HIP = 23
+    const val RIGHT_HIP = 24
+    const val LEFT_KNEE = 25
+    const val RIGHT_KNEE = 26
+    const val LEFT_ANKLE = 27
+    const val RIGHT_ANKLE = 28
 }

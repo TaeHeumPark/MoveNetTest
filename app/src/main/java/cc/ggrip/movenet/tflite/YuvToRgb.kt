@@ -4,104 +4,93 @@ package cc.ggrip.movenet.tflite
 import android.content.Context
 import android.graphics.Bitmap
 import android.renderscript.*
-import java.io.Closeable
 
+// RenderScript는 deprecated지만, 기존 프로젝트 호환을 위해 유지
 @Suppress("DEPRECATION")
-class YuvToRgb(context: Context) : Closeable {
+class YuvToRgb(context: Context) {
     private val rs = RenderScript.create(context)
     private val script = ScriptIntrinsicYuvToRGB.create(rs, Element.U8_4(rs))
-    private var yuvAllocation: Allocation? = null
-    private var rgbAllocation: Allocation? = null
-    private var cachedNv21: ByteArray? = null
-    private var lastW = -1
-    private var lastH = -1
 
     fun yuvToRgb(image: android.media.Image, output: Bitmap) {
-        val nv21 = ImageUtil.yuv420ThreePlanesToNV21(
-            image.planes, image.width, image.height, cachedNv21
-        )
-        cachedNv21 = nv21
+        val yuvBytes = ImageUtil.yuv420ThreePlanesToNV21(image.planes, image.width, image.height)
 
-        if (yuvAllocation == null || lastW != image.width || lastH != image.height) {
-            yuvAllocation?.destroy()
-            yuvAllocation = Allocation.createTyped(
-                rs,
-                Type.Builder(rs, Element.U8(rs)).setX(nv21.size).create(),
-                Allocation.USAGE_SCRIPT
-            )
-        }
-        if (rgbAllocation == null ||
-            rgbAllocation!!.type.x != output.width || rgbAllocation!!.type.y != output.height
-        ) {
-            rgbAllocation?.destroy()
-            rgbAllocation = Allocation.createTyped(
-                rs,
-                Type.Builder(rs, Element.RGBA_8888(rs))
-                    .setX(output.width).setY(output.height).create(),
-                Allocation.USAGE_SCRIPT
-            )
-        }
-        lastW = image.width; lastH = image.height
+        // 프레임 단위 Allocation은 즉시 해제 (누수 로그 방지)
+        val yuvType = Type.Builder(rs, Element.U8(rs)).setX(yuvBytes.size).create()
+        val allocationYuv = Allocation.createTyped(rs, yuvType, Allocation.USAGE_SCRIPT)
 
-        yuvAllocation!!.copyFrom(nv21)
-        script.setInput(yuvAllocation)
-        script.forEach(rgbAllocation)
-        rgbAllocation!!.copyTo(output)
+        val rgbaType = Type.Builder(rs, Element.RGBA_8888(rs))
+            .setX(output.width).setY(output.height).create()
+        val allocationRgb = Allocation.createTyped(rs, rgbaType, Allocation.USAGE_SCRIPT)
+
+        try {
+            allocationYuv.copyFrom(yuvBytes)
+            script.setInput(allocationYuv)
+            script.forEach(allocationRgb)
+            allocationRgb.copyTo(output)
+        } finally {
+            try { allocationYuv.destroy() } catch (_: Exception) {}
+            try { allocationRgb.destroy() } catch (_: Exception) {}
+        }
     }
 
-    override fun close() {
-        try { yuvAllocation?.destroy() } catch (_: Exception) {}
-        try { rgbAllocation?.destroy() } catch (_: Exception) {}
+    fun release() {
         try { script.destroy() } catch (_: Exception) {}
         try { rs.destroy() } catch (_: Exception) {}
     }
 }
 
 object ImageUtil {
+    // 안정적인 NV21 변환 (Android 공식 샘플 패턴 기반)
     fun yuv420ThreePlanesToNV21(
         planes: Array<android.media.Image.Plane>,
         width: Int,
-        height: Int,
-        reuse: ByteArray? = null
+        height: Int
     ): ByteArray {
         val imageSize = width * height
-        val outSize = imageSize + 2 * (imageSize / 4)
-        val out = if (reuse != null && reuse.size >= outSize) reuse else ByteArray(outSize)
+        val out = ByteArray(imageSize + 2 * (imageSize / 4))
 
-        val yPlane = planes[0].buffer
-        val uPlane = planes[1].buffer
-        val vPlane = planes[2].buffer
+        // Y
+        val yBuffer = planes[0].buffer
+        val yRowStride = planes[0].rowStride
+        var pos = 0
+        if (yRowStride == width) {
+            yBuffer.get(out, 0, imageSize)
+            pos += imageSize
+        } else {
+            var y = 0
+            while (y < height) {
+                yBuffer.position(y * yRowStride)
+                yBuffer.get(out, pos, width)
+                pos += width
+                y++
+            }
+        }
 
-        yPlane.rewind()
-        yPlane.get(out, 0, imageSize)
+        // VU (NV21)
+        val uBuffer = planes[1].buffer
+        val vBuffer = planes[2].buffer
+        val chromaRowStride = planes[1].rowStride
+        val chromaPixelStride = planes[1].pixelStride // usually 2
 
+        // interleave V and U
         val chromaHeight = height / 2
         val chromaWidth = width / 2
-        var offset = imageSize
-        val uRowStride = planes[1].rowStride
         val vRowStride = planes[2].rowStride
-        val uPixelStride = planes[1].pixelStride
         val vPixelStride = planes[2].pixelStride
-        for (row in 0 until chromaHeight) {
-            val uRow = row * uRowStride
-            val vRow = row * vRowStride
-            for (col in 0 until chromaWidth) {
-                out[offset++] = vPlane.get(vRow + col * vPixelStride)
-                out[offset++] = uPlane.get(uRow + col * uPixelStride)
+        var row = 0
+        while (row < chromaHeight) {
+            var col = 0
+            while (col < chromaWidth) {
+                val vuIndex = pos
+                val vIndex = row * vRowStride + col * vPixelStride
+                val uIndex = row * chromaRowStride + col * chromaPixelStride
+                out[vuIndex] = vBuffer.get(vIndex)
+                out[vuIndex + 1] = uBuffer.get(uIndex)
+                pos += 2
+                col++
             }
+            row++
         }
         return out
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
