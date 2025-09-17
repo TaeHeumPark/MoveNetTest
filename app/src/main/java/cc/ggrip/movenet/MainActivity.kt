@@ -74,8 +74,8 @@ class MainActivity : AppCompatActivity() {
 
         supportFragmentManager.commit {
             val frag = when (item.engine) {
-                Engine.MOVENET   -> RealtimeDotsFragment.newInstance(45.0, item.tier)
-                Engine.MEDIAPIPE -> MediaPipeRealtimeFragment.newInstance(45.0, item.tier)
+                Engine.MOVENET   -> RealtimeDotsFragment.newInstance(30.0, item.tier)
+                Engine.MEDIAPIPE -> MediaPipeRealtimeFragment.newInstance(30.0, item.tier)
             }
             replace(R.id.fragmentContainer, frag)
         }

@@ -1,4 +1,4 @@
-// MediaPipePoseProcessor.kt
+﻿// MediaPipePoseProcessor.kt
 package cc.ggrip.movenet.mediapipe
 
 import android.content.Context
@@ -29,22 +29,27 @@ class MediaPipePoseProcessor(
     private val context: Context = context.applicationContext
     private val yuv = YuvToRgb(context)
     private var landmarker: PoseLandmarker? = null
+
     @Volatile private var delegateLabel: String = "CPU"
     fun currentDelegate(): String = delegateLabel
-    private val tsQueue = java.util.concurrent.ConcurrentLinkedQueue<Long>()
 
     // 백프레셔 상태
     @Volatile private var inFlight = false
-    @Volatile private var lastSrcTsMs: Long = -1L
-    @Volatile private var inFlightSince: Long = 0L
+    @Volatile private var lastFrameReceivedTsMs: Long = -1L  // 앱이 프레임을 받은 시각(boottime ms)
+    @Volatile private var inFlightSince: Long = 0L           // inFlight가 시작된 시각
+    @Volatile private var lastAlgoStartTsMs: Long = -1L      // 추론 시작 시각(boottime ms)
 
     // 연속 에러 카운트 (GPU→CPU 폴백 트리거)
     @Volatile private var errCount = 0
 
     init {
-        // heavy는 CPU 우선 (원하면 true로 바꿔 GPU 먼저 시도)
+        // 무거운 모델에서 CPU를 우선 사용하고 싶으면 isHeavy = true 로 변경
         val isHeavy = false
-        landmarker = if (isHeavy) tryCreate(Delegate.CPU) else tryCreate(Delegate.GPU) ?: tryCreate(Delegate.CPU)
+        landmarker = if (isHeavy) {
+            tryCreate(Delegate.CPU)
+        } else {
+            tryCreate(Delegate.GPU) ?: tryCreate(Delegate.CPU)
+        }
     }
 
     private fun recreateWithCpu() {
@@ -66,19 +71,20 @@ class MediaPipePoseProcessor(
                 .setMinPoseDetectionConfidence(0.3f)
                 .setMinPosePresenceConfidence(0.3f)
                 .setMinTrackingConfidence(0.3f)
-                // ★ 2-인자 리스너 (result, inputImage)
+                // ★ 2-인자 리스너(result, inputImage)
                 .setResultListener { result, _: MPImage ->
-                    val srcTs = lastSrcTsMs
-                    val algoDone = android.os.SystemClock.elapsedRealtime()
+                    val frameTs = lastFrameReceivedTsMs
+                    val algoStartTs = lastAlgoStartTsMs
+                    val algoDone = SystemClock.elapsedRealtime()
 
                     val lmList = result.landmarks().firstOrNull()
-                    if (!lmList.isNullOrEmpty() && srcTs > 0) {
+                    if (!lmList.isNullOrEmpty() && frameTs > 0 && algoStartTs > 0) {
                         val n = lmList.size
                         val screen2d = FloatArray(n * 2)
                         for (i in 0 until n) {
                             val lm = lmList[i]
-                            screen2d[i*2]     = lm.x()
-                            screen2d[i*2 + 1] = lm.y()
+                            screen2d[i * 2]     = lm.x()
+                            screen2d[i * 2 + 1] = lm.y()
                         }
                         onResult(
                             PoseFrame(
@@ -86,7 +92,10 @@ class MediaPipePoseProcessor(
                                 world = floatArrayOf(),
                                 screen2d = screen2d,
                                 visibility = null,
-                                srcTsMs = srcTs,
+                                // E2E 시작: 앱이 프레임을 받은 시각(boottime ms)
+                                frameReceivedTsMs = frameTs,
+                                // 알고리즘 지연: 추론 시작/종료(boottime ms)
+                                algoStartTsMs = algoStartTs,
                                 algoDoneTsMs = algoDone
                             )
                         )
@@ -94,15 +103,17 @@ class MediaPipePoseProcessor(
                         onResult(null)
                     }
 
-                    // 성공 → 상태 초기화
+                    // 백프레셔 상태 초기화
                     errCount = 0
-                    lastSrcTsMs = -1L
+                    lastFrameReceivedTsMs = -1L
+                    lastAlgoStartTsMs = -1L
                     inFlight = false
                 }
-                // ✅ 에러 리스너: 막히면 풀고, GPU면 CPU로 폴백
+                // 에러 리스너: 막힘 해제, GPU 사용 중이면 CPU로 폴백
                 .setErrorListener { e ->
                     errCount++
-                    lastSrcTsMs = -1L
+                    lastFrameReceivedTsMs = -1L
+                    lastAlgoStartTsMs = -1L
                     inFlight = false
                     if (delegate == Delegate.GPU && errCount >= 1) {
                         recreateWithCpu()
@@ -127,16 +138,18 @@ class MediaPipePoseProcessor(
 
     @OptIn(ExperimentalGetImage::class)
     fun process(imageProxy: ImageProxy) {
-        val tsMs = imageProxy.imageInfo.timestamp / 1_000_000L
+        val frameReceivedTs = SystemClock.elapsedRealtime()             // 앱에서 프레임을 받은 시각(E2E 시작점)
+        val tsMs = imageProxy.imageInfo.timestamp / 1_000_000L         // MediaPipe LIVE_STREAM용 입력 타임스탬프(ms)
         try {
-            // ✅ watchdog: 콜백이 너무 오래 안 오면 해제
-            if (inFlight && android.os.SystemClock.elapsedRealtime() - inFlightSince > 1200) {
+            // 워치독: 콜백이 1.2초 넘게 안 오면 리셋
+            if (inFlight && SystemClock.elapsedRealtime() - inFlightSince > 1200) {
                 inFlight = false
-                lastSrcTsMs = -1L
+                lastFrameReceivedTsMs = -1L
+                lastAlgoStartTsMs = -1L
             }
             if (inFlight) { imageProxy.close(); return }
 
-            // YUV→RGB, 회전, 중앙 정사각형 크롭
+            // YUV→RGB, 회전 보정, 중앙 정사각형 크롭
             val srcBmp = Bitmap.createBitmap(imageProxy.width, imageProxy.height, Bitmap.Config.ARGB_8888)
             yuv.yuvToRgb(imageProxy.image!!, srcBmp)
             val rot = imageProxy.imageInfo.rotationDegrees
@@ -149,13 +162,17 @@ class MediaPipePoseProcessor(
             val mpImg = BitmapImageBuilder(square).build()
 
             // 호출 직전 상태 세팅
-            lastSrcTsMs = tsMs
+            lastFrameReceivedTsMs = frameReceivedTs
+            val algoStart = SystemClock.elapsedRealtime()
+            lastAlgoStartTsMs = algoStart
             inFlight = true
-            inFlightSince = android.os.SystemClock.elapsedRealtime()
+            inFlightSince = algoStart
 
+            // 추론 요청 (라이브 스트림 타임스탬프 전달)
             landmarker?.detectAsync(mpImg, tsMs)
         } catch (_: Throwable) {
-            lastSrcTsMs = -1L
+            lastFrameReceivedTsMs = -1L
+            lastAlgoStartTsMs = -1L
             inFlight = false
             onResult(null)
         } finally {

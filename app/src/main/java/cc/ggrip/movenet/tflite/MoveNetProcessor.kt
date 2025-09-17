@@ -1,4 +1,4 @@
-// MoveNetProcessor.kt
+﻿// MoveNetProcessor.kt
 package cc.ggrip.movenet.tflite
 
 import android.content.Context
@@ -13,8 +13,8 @@ import cc.ggrip.movenet.pose.PoseFrame
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Delegate
 import org.tensorflow.lite.Interpreter
-import org.tensorflow.lite.gpu.CompatibilityList          // ★ 공식 문서 방식
-import org.tensorflow.lite.gpu.GpuDelegate               // ★ 공식 문서 방식
+import org.tensorflow.lite.gpu.CompatibilityList          // GPU 호환성 리스트
+import org.tensorflow.lite.gpu.GpuDelegate               // GPU Delegate
 import org.tensorflow.lite.support.common.ops.NormalizeOp
 import org.tensorflow.lite.support.image.ImageProcessor
 import org.tensorflow.lite.support.image.TensorImage
@@ -34,7 +34,8 @@ class MoveNetProcessor(
     private val interpreter: Interpreter
     private val yuv = YuvToRgb(context)
 
-    private var gpuDelegate: GpuDelegate? = null        // ★ 실제 타입으로 보관 (AutoCloseable)
+    // GPU delegate 핸들 (AutoCloseable)
+    private var gpuDelegate: GpuDelegate? = null
     @Volatile private var delegateLabel: String = "CPU(XNNPACK)"
     fun currentDelegate(): String = delegateLabel
 
@@ -42,10 +43,11 @@ class MoveNetProcessor(
     private lateinit var imageProcessor: ImageProcessor
 
     init {
-//        val model = loadModel(context, "models/movenet_thunder_fp16.tflite")
+        // 모델 로드
+        // val model = loadModel(context, "models/movenet_thunder_fp16.tflite")
         val model = loadModel(context, assetPath)
 
-        // ★ 공식 문서: GPU 지원이면 GPU Delegate, 아니면 CPU(XNNPACK)
+        // 디바이스 능력에 따라: GPU 지원 시 GPU Delegate, 아니면 CPU(XNNPACK)
         val compat = try { CompatibilityList() } catch (t: Throwable) {
             Log.w(TAG, "GPU CompatibilityList not available: ${t.message}")
             null
@@ -56,9 +58,9 @@ class MoveNetProcessor(
 
         if (gpuSupported) {
             try {
-                // 기기 최적 옵션 기반으로 Delegate 생성
+                // 권장 옵션으로 GPU delegate 생성
                 val dOpts = compat!!.bestOptionsForThisDevice
-                // 안정화 옵션(양자화/FP16 모델 모두 고려)
+                // 추가 최적화(가능한 경우): FP16/양자화 모델 허용
                 try { dOpts.setPrecisionLossAllowed(true) } catch (_: Throwable) {}
                 try { dOpts.setQuantizedModelsAllowed(true) } catch (_: Throwable) {}
 
@@ -68,13 +70,13 @@ class MoveNetProcessor(
                 Log.i(TAG, "Using GPU delegate")
             } catch (t: Throwable) {
                 Log.w(TAG, "GPU delegate init failed, fallback to CPU: ${t.message}", t)
-                // CPU로 세팅
+                // GPU 실패 시 CPU(XNNPACK)로 폴백
                 opts.setUseXNNPACK(true)
                 opts.setNumThreads(Runtime.getRuntime().availableProcessors().coerceAtMost(4))
                 delegateLabel = "CPU(XNNPACK)"
             }
         } else {
-            // GPU 미지원 → CPU(XNNPACK)
+            // GPU 미지원: CPU(XNNPACK)
             opts.setUseXNNPACK(true)
             opts.setNumThreads(Runtime.getRuntime().availableProcessors().coerceAtMost(4))
             delegateLabel = "CPU(XNNPACK)"
@@ -85,12 +87,12 @@ class MoveNetProcessor(
             Interpreter(model, opts)
         } catch (t: Throwable) {
             Log.w(TAG, "Interpreter init failed with $delegateLabel: ${t.message}. Falling back to pure CPU.")
-            // 최후의 보루: 완전 CPU
+            // 최종 폴백: 순수 CPU
             val cpuOnly = Interpreter.Options().apply {
                 setUseXNNPACK(true)
                 setNumThreads(Runtime.getRuntime().availableProcessors().coerceAtMost(4))
             }
-            // GPU delegate 자원 정리
+            // GPU delegate 자원 해제
             try { gpuDelegate?.close() } catch (_: Exception) {}
             gpuDelegate = null
             delegateLabel = "CPU(XNNPACK)"
@@ -99,7 +101,7 @@ class MoveNetProcessor(
 
         Log.i(TAG, "TFLite interpreter ready. delegate=$delegateLabel")
 
-        // 입력 텐서 세팅
+        // 입력 텐서/전처리 파이프라인 준비
         val inTensor = interpreter.getInputTensor(0)
         val inType = inTensor.dataType()
         val inShape = inTensor.shape() // [1, H, W, 3]
@@ -108,7 +110,8 @@ class MoveNetProcessor(
         val ipBuilder = ImageProcessor.Builder()
             .add(ResizeOp(inShape[1], inShape[2], ResizeOp.ResizeMethod.BILINEAR))
         if (inType == DataType.FLOAT32) {
-            ipBuilder.add(NormalizeOp(127.5f, 127.5f))   // [-1, 1] 정규화 (FP16/Float 입력)
+            // [-1, 1] 정규화(일반적인 FP16/Float 입력)
+            ipBuilder.add(NormalizeOp(127.5f, 127.5f))
         }
         imageProcessor = ipBuilder.build()
 
@@ -119,13 +122,14 @@ class MoveNetProcessor(
 
     fun close() {
         try { interpreter.close() } catch (_: Exception) {}
-        try { gpuDelegate?.close() } catch (_: Exception) {} // ★ GPU 자원 해제
+        try { gpuDelegate?.close() } catch (_: Exception) {} // GPU delegate 해제
         gpuDelegate = null
     }
 
     @OptIn(ExperimentalGetImage::class)
     fun process(imageProxy: ImageProxy) {
-        val tsMs = imageProxy.imageInfo.timestamp / 1_000_000L
+        // 앱이 프레임을 받은 시각(E2E 시작점; boottime ms)
+        val frameReceivedTs = SystemClock.elapsedRealtime()
         try {
             // YUV → ARGB
             val srcBmp = Bitmap.createBitmap(imageProxy.width, imageProxy.height, Bitmap.Config.ARGB_8888)
@@ -136,27 +140,29 @@ class MoveNetProcessor(
             val mat = Matrix().apply { postRotate(rot.toFloat()) }
             val rotated = Bitmap.createBitmap(srcBmp, 0, 0, srcBmp.width, srcBmp.height, mat, false)
 
-            // 중심 정사각형 크롭
+            // 중앙 정사각형 크롭
             val size = minOf(rotated.width, rotated.height)
             val left = (rotated.width  - size) / 2
             val top  = (rotated.height - size) / 2
             val square = Bitmap.createBitmap(rotated, left, top, size, size)
 
-            // 전처리(리사이즈 + 정규화)
+            // 텐서 로드 + 전처리
             inputImage.load(square)
             val inputBuffer = imageProcessor.process(inputImage).buffer
             inputBuffer.rewind()
 
-            // 출력 준비 & 추론
+            // 출력 버퍼 준비
             val outTensor = interpreter.getOutputTensor(0)
             val outShape = outTensor.shape()
             val outType  = outTensor.dataType()
             val outBuf   = TensorBuffer.createFixedSize(outShape, outType)
 
+            // 알고리즘 지연: 추론 시작(카메라/전처리 제외) → 추론 종료
+            val algoStart = SystemClock.elapsedRealtime()
             interpreter.run(inputBuffer, outBuf.buffer.rewind())
             val algoDone = SystemClock.elapsedRealtime()
 
-            // MoveNet: [1,1,17,3] (y, x, score)
+            // MoveNet 출력: [1,1,17,3] (y, x, score)
             val floats: FloatArray = when (outType) {
                 DataType.FLOAT32 -> outBuf.floatArray
                 DataType.UINT8 -> {
@@ -172,6 +178,7 @@ class MoveNetProcessor(
                 }
             }
 
+            // 화면 정규화 좌표(x,y)로 변환 (크롭 공간 기준)
             val screenCropNorm = FloatArray(17 * 2)
             for (i in 0 until 17) {
                 val b = i * 3
@@ -187,7 +194,10 @@ class MoveNetProcessor(
                     world = floatArrayOf(),
                     screen2d = screenCropNorm,
                     visibility = null,
-                    srcTsMs = tsMs,
+                    // E2E 시작: 앱이 프레임을 받은 시각
+                    frameReceivedTsMs = frameReceivedTs,
+                    // 알고리즘 지연: 추론 시작/종료
+                    algoStartTsMs = algoStart,
                     algoDoneTsMs = algoDone
                 )
             )
@@ -202,6 +212,7 @@ class MoveNetProcessor(
     // ---------- 모델 로딩 ----------
     private fun loadModel(context: Context, assetPath: String): ByteBuffer {
         return try {
+            // AssetFileDescriptor 경로(권장): 메모리 매핑으로 로드
             context.assets.openFd(assetPath).use { fd ->
                 fd.createInputStream().channel.map(
                     FileChannel.MapMode.READ_ONLY,
@@ -210,6 +221,7 @@ class MoveNetProcessor(
                 ).order(ByteOrder.nativeOrder())
             }
         } catch (e: Throwable) {
+            // AFD가 안 될 때: 일반 스트림으로 로드
             Log.w(TAG, "openFd() failed ($assetPath). Falling back to stream load")
             context.assets.open(assetPath).use { ins ->
                 val bytes = ins.readBytes()
