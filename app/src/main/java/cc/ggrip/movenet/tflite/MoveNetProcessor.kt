@@ -28,7 +28,8 @@ private const val TAG = "MoveNet"
 
 class MoveNetProcessor(
     context: Context,
-    private val onResult: (PoseFrame?) -> Unit
+    private val onResult: (PoseFrame?) -> Unit,
+    assetPath: String
 ) {
     private val interpreter: Interpreter
     private val yuv = YuvToRgb(context)
@@ -41,7 +42,8 @@ class MoveNetProcessor(
     private lateinit var imageProcessor: ImageProcessor
 
     init {
-        val model = loadModel(context, "models/movenet_lightning_fp16.tflite")
+//        val model = loadModel(context, "models/movenet_thunder_fp16.tflite")
+        val model = loadModel(context, assetPath)
 
         // ★ 공식 문서: GPU 지원이면 GPU Delegate, 아니면 CPU(XNNPACK)
         val compat = try { CompatibilityList() } catch (t: Throwable) {

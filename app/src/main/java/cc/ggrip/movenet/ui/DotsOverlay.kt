@@ -20,11 +20,16 @@ class DotsOverlay(
     @Volatile private var frame: PoseFrame? = null
     @Volatile private var mirrorX: Boolean = false
     @Volatile private var flipY: Boolean = false
-    // 필드 추가
+
     @Volatile private var accelLabel: String = "CPU"
     fun setAcceleratorLabel(label: String) { accelLabel = label; postInvalidateOnAnimation() }
 
-    // ★ 프리뷰 소스(회전 적용 후) 크기
+    @Volatile private var engineLabel: String = "MoveNet"
+    fun setEngineLabel(label: String) { engineLabel = label; postInvalidateOnAnimation() }
+
+    @Volatile private var modelLabel: String = "-"
+    fun setModelLabel(label: String) { modelLabel = label; postInvalidateOnAnimation() }
+
     @Volatile private var srcW: Int = 0
     @Volatile private var srcH: Int = 0
 
@@ -65,17 +70,13 @@ class DotsOverlay(
             val offX = (W - srcW * scale) / 2f
             val offY = (H - srcH * scale) / 2f
 
-            // ★ 입력(정사각형 0..1) → 소스(회전적용 프레임) → 뷰 좌표로 가는 매트릭스
             val cropSize = min(srcW, srcH).toFloat()
             val cropL = (srcW - cropSize) / 2f
             val cropT = (srcH - cropSize) / 2f
             val m = Matrix().apply {
-                // unit square → 실제 crop 사각형
                 setRectToRect(RectF(0f, 0f, 1f, 1f), RectF(cropL, cropT, cropL + cropSize, cropT + cropSize), Matrix.ScaleToFit.FILL)
-                // 소스 → 뷰 (FILL_CENTER)
                 postScale(scale, scale)
                 postTranslate(offX, offY)
-                // 미러/플립(프리뷰 컨텐트 중심 기준)
                 if (mirrorX || flipY) {
                     val px = offX + srcW * scale / 2f
                     val py = offY + srcH * scale / 2f
@@ -84,15 +85,15 @@ class DotsOverlay(
             }
 
             val p = f.screen2d
+            val n = p.size / 2  // <= 17(MoveNet) or 33(MediaPipe)
             val tmp = FloatArray(2)
-            for (i in 0 until 17) {
-                tmp[0] = p[i*2]     // x in [0,1]
-                tmp[1] = p[i*2 + 1] // y in [0,1]
+            for (i in 0 until n) {
+                tmp[0] = p[i*2]
+                tmp[1] = p[i*2 + 1]
                 m.mapPoints(tmp)
                 canvas.drawCircle(tmp[0], tmp[1], 10f, dotPaint)
             }
 
-            // ---- HUD (지연 통계) ----
             val nowMs = android.os.SystemClock.elapsedRealtime()
             if (f.srcTsMs > 0) {
                 val e2e = nowMs - f.srcTsMs
@@ -107,7 +108,7 @@ class DotsOverlay(
             fun fmtFr(d: Double) = if (d.isNaN()) "-" else "%.2f".format(d)
 
             val lines = listOf(
-                "MoveNet • 목표 FPS ${"%.0f".format(targetFps)}",
+                "$engineLabel • $modelLabel • 목표 ${"%.0f".format(targetFps)} FPS",
                 "가속기: $accelLabel",
                 "알고리즘 지연 평균/95퍼: ${fmtMs(stats.algoAvg)} / ${fmtMs(stats.algoP95)} ms",
                 "E2E 평균/95퍼: ${fmtMs(stats.e2eAvg)} / ${fmtMs(stats.e2eP95)} ms",
@@ -120,10 +121,7 @@ class DotsOverlay(
             var yText = 16f + pad + hudPaint.textSize
             for (ln in lines) { canvas.drawText(ln, 16f + pad, yText, hudPaint); yText += hudPaint.textSize }
         } else {
-            // 초기 HUD
-            val msg = listOf(
-                if (srcW == 0 || srcH == 0) "소스 크기 대기…" else "키포인트 대기…"
-            )
+            val msg = listOf(if (srcW == 0 || srcH == 0) "소스 크기 대기…" else "키포인트 대기…")
             val pad = 12f
             val boxW = msg.maxOf { hudPaint.measureText(it) } + pad * 2
             val boxH = hudPaint.textSize * msg.size + pad * 2

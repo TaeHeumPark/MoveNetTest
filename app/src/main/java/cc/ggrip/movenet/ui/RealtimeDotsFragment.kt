@@ -1,11 +1,10 @@
-// RealtimeDotsFragment.kt
+// RealtimeDotsFragment.kt  (핵심 변경: 모델 tier/경로 인자, HUD 타이틀/모델 라벨 설정)
 package cc.ggrip.movenet.ui
 
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.util.Rational
-import android.util.Size
 import android.view.*
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import androidx.activity.result.contract.ActivityResultContracts
@@ -20,6 +19,8 @@ import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.Fragment
 import cc.ggrip.movenet.R
+import cc.ggrip.movenet.bench.ModelAssets
+import cc.ggrip.movenet.bench.Tier
 import cc.ggrip.movenet.tflite.MoveNetProcessor
 import cc.ggrip.movenet.util.FpsGovernor
 import cc.ggrip.movenet.util.LatencyMeter
@@ -29,8 +30,13 @@ class RealtimeDotsFragment : Fragment() {
 
     companion object {
         private const val ARG_FPS = "target_fps"
-        fun newInstance(targetFps: Double) = RealtimeDotsFragment().apply {
-            arguments = Bundle().apply { putDouble(ARG_FPS, targetFps) }
+        private const val ARG_TIER = "tier"
+
+        fun newInstance(targetFps: Double, tier: Tier) = RealtimeDotsFragment().apply {
+            arguments = Bundle().apply {
+                putDouble(ARG_FPS, targetFps)
+                putString(ARG_TIER, tier.name)
+            }
         }
     }
 
@@ -40,6 +46,7 @@ class RealtimeDotsFragment : Fragment() {
     private lateinit var fpsGov: FpsGovernor
     private lateinit var latencyMeter: LatencyMeter
     private var targetFps = 30.0
+    private var chosenTier: Tier = Tier.MID
 
     private var cameraProvider: ProcessCameraProvider? = null
     private var analysis: ImageAnalysis? = null
@@ -53,6 +60,7 @@ class RealtimeDotsFragment : Fragment() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         targetFps = arguments?.getDouble(ARG_FPS, 30.0) ?: 30.0
+        chosenTier = arguments?.getString(ARG_TIER)?.let { Tier.valueOf(it) } ?: Tier.MID
         fpsGov = FpsGovernor(targetFps)
         latencyMeter = LatencyMeter()
     }
@@ -73,16 +81,22 @@ class RealtimeDotsFragment : Fragment() {
         ).also {
             (view as ViewGroup).addView(it, ViewGroup.LayoutParams(MATCH_PARENT, MATCH_PARENT))
             it.bringToFront()
-            // 전면 카메라 기준: 좌우 미러 + 상하 플립(머리가 화면 위쪽)
-            it.setMirrorFlip(mirrorX = true, flipY = false)
+            it.setMirrorFlip(mirrorX = true, flipY = false) // 전면 카메라 기준
+            it.setEngineLabel("MoveNet")
+            it.setModelLabel(
+                when (chosenTier) {
+                    Tier.LIGHT -> "lightning"
+                    Tier.MID, Tier.HEAVY -> "thunder"
+                }
+            )
         }
 
-        processor = MoveNetProcessor(requireContext()) { frame ->
+        val assetPath = ModelAssets.movenetPath(chosenTier)
+        processor = MoveNetProcessor(requireContext(), { frame ->
             frame?.let { overlay.post { overlay.update(it) } }
-        }
+        }, assetPath)
 
         overlay.setAcceleratorLabel(processor.currentDelegate())
-
         ensurePerm()
     }
 
@@ -101,16 +115,14 @@ class RealtimeDotsFragment : Fragment() {
             val rotation = requireView().display?.rotation ?: Surface.ROTATION_0
 
             val preview = Preview.Builder()
-                .setTargetRotation(rotation) // ★ rotation 통일
-                .build().also {
-                    it.setSurfaceProvider(previewView.surfaceProvider)
-                }
+                .setTargetRotation(rotation)
+                .build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
 
             analysis = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
-                .setTargetRotation(rotation)                 // ★ rotation 통일
-                .setTargetAspectRatio(AspectRatio.RATIO_4_3) // ★ 해상도 강제 대신 AR만 통일
+                .setTargetRotation(rotation)
+                .setTargetAspectRatio(AspectRatio.RATIO_4_3)
                 .build().also { ia ->
                     ia.setAnalyzer(analyzerExecutor) { imageProxy ->
                         val tsNs = imageProxy.imageInfo.timestamp
@@ -121,25 +133,17 @@ class RealtimeDotsFragment : Fragment() {
                         val srcH = if (rot % 180 == 0) imageProxy.height else imageProxy.width
                         overlay.setSourceSize(srcW, srcH)
 
-                        processor.process(imageProxy) // 내부에서 close()
+                        processor.process(imageProxy)
                     }
                 }
 
-            val selector = CameraSelector.Builder()
-                .requireLensFacing(CameraSelector.LENS_FACING_FRONT)
-                .build()
+            val selector = CameraSelector.Builder().requireLensFacing(CameraSelector.LENS_FACING_FRONT).build()
 
-            // ★★★ Preview와 Analysis에 동일한 ViewPort를 적용
-            //     (PreviewView의 가시 영역과 동일한 FILL_CENTER 스케일/크롭을 카메라 파이프라인이 공유)
             if (previewView.width == 0 || previewView.height == 0) {
-                // 레이아웃 직후에 다시 시도
-                previewView.post { startCamera() }
-                return@addListener
+                previewView.post { startCamera() }; return@addListener
             }
-            val vp = ViewPort.Builder(
-                Rational(previewView.width, previewView.height),
-                rotation
-            ).setScaleType(ViewPort.FILL_CENTER).build()
+            val vp = ViewPort.Builder(Rational(previewView.width, previewView.height), rotation)
+                .setScaleType(ViewPort.FILL_CENTER).build()
 
             val group = UseCaseGroup.Builder()
                 .setViewPort(vp)
@@ -151,5 +155,10 @@ class RealtimeDotsFragment : Fragment() {
             cameraProvider?.bindToLifecycle(viewLifecycleOwner, selector, group)
 
         }, ContextCompat.getMainExecutor(requireContext()))
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        try { processor.close() } catch (_: Exception) {}
     }
 }
