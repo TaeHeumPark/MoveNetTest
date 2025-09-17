@@ -121,6 +121,7 @@ class MoveNetProcessor(
     }
 
     fun close() {
+        try { yuv.release() } catch (_: Exception) {}
         try { interpreter.close() } catch (_: Exception) {}
         try { gpuDelegate?.close() } catch (_: Exception) {} // GPU delegate 해제
         gpuDelegate = null

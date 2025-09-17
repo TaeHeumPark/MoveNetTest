@@ -180,5 +180,8 @@ class MediaPipePoseProcessor(
         }
     }
 
-    fun close() { try { landmarker?.close() } catch (_: Exception) {} }
+    fun close() {
+        try { landmarker?.close() } catch (_: Exception) {}
+        try { yuv.release() } catch (_: Exception) {}
+    }
 }
