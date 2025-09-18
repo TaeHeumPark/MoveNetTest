@@ -6,4 +6,9 @@
         android:title="모델"
         android:icon="@android:drawable/ic_menu_manage"
         app:showAsAction="always" />
+    <item
+        android:id="@+id/action_video"
+        android:title="@string/video_analysis_title"
+        android:icon="@android:drawable/ic_menu_slideshow"
+        app:showAsAction="always" />
 </menu>

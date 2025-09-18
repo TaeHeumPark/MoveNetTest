@@ -31,6 +31,8 @@ class DotsOverlay(
 
     @Volatile private var modelLabel: String = "-"
     fun setModelLabel(label: String) { modelLabel = label; postInvalidateOnAnimation() }
+    @Volatile private var firstFrameReceivedAtMs: Long = -1L
+    @Volatile private var firstUiLatencyMs: Long = -1L
 
     @Volatile private var srcW: Int = 0
     @Volatile private var srcH: Int = 0
@@ -48,8 +50,13 @@ class DotsOverlay(
         }
     }
 
-    fun update(f: PoseFrame) { frame = f; postInvalidateOnAnimation() }
-
+    fun update(f: PoseFrame) {
+        if (firstFrameReceivedAtMs < 0 && f.frameReceivedTsMs > 0) {
+            firstFrameReceivedAtMs = f.frameReceivedTsMs
+        }
+        frame = f
+        postInvalidateOnAnimation()
+    }
     private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = 0xFFFFCC00.toInt()
         style = Paint.Style.FILL
@@ -113,11 +120,16 @@ class DotsOverlay(
             // HUD: 지연 통계
             val nowMs = SystemClock.elapsedRealtime()
             val startTs = f.frameReceivedTsMs  // 앱이 프레임을 받은 시각(boottime ms) 사용
+            var latestE2eMs = -1L
             if (startTs > 0) {
                 val e2e = nowMs - startTs
+                latestE2eMs = e2e
                 val algo = if (f.algoStartTsMs > 0 && f.algoDoneTsMs > 0) {
                     f.algoDoneTsMs - f.algoStartTsMs
                 } else -1L
+                if (firstUiLatencyMs < 0 && firstFrameReceivedAtMs >= 0) {
+                    firstUiLatencyMs = nowMs - firstFrameReceivedAtMs
+                }
                 meter.push(algo, e2e)
             }
 
@@ -128,12 +140,15 @@ class DotsOverlay(
 
             fun fmtMs(d: Double) = if (d.isNaN()) "-" else "%.1f".format(d)
             fun fmtFr(d: Double) = if (d.isNaN()) "-" else "%.2f".format(d)
+            fun fmtMsLong(value: Long) = if (value < 0) "-" else fmtMs(value.toDouble())
 
             val lines = listOf(
                 "$engineLabel • $modelLabel • 목표 ${"%.0f".format(targetFps)} FPS",
                 "가속기: $accelLabel",
                 "알고리즘 지연 평균/95퍼: ${fmtMs(stats.algoAvg)} / ${fmtMs(stats.algoP95)} ms",
                 "E2E 평균/95퍼: ${fmtMs(stats.e2eAvg)} / ${fmtMs(stats.e2eP95)} ms",
+                "카메라->UI(최근): ${fmtMsLong(latestE2eMs)} ms",
+                "첫 프레임 지연: ${fmtMsLong(firstUiLatencyMs)} ms",
                 "프레임 지연: ${fmtFr(eAvgF)}프 (평균) | ${fmtFr(eP95F)}프 (95p)"
             )
 

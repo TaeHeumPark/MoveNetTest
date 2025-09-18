@@ -11,6 +11,10 @@ android {
         pickFirst ("lib/**/libtensorflowlite_jni.so")
     }
 
+    androidResources {
+        noCompress += listOf("task", "tflite") // 둘 다 추천
+    }
+
     defaultConfig {
         applicationId = "cc.ggrip.movenet"
         minSdk = 33
@@ -60,6 +64,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
     implementation("androidx.fragment:fragment-ktx:1.8.2")
 
+    implementation("com.google.android.exoplayer:exoplayer:2.19.1")
     implementation("com.google.mediapipe:tasks-vision:0.20230731")
     implementation("androidx.camera:camera-camera2:1.5.0")
     implementation("androidx.camera:camera-lifecycle:1.5.0")
