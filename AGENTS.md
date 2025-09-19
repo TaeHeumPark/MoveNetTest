@@ -1,5 +1,7 @@
 ﻿# Repository Guidelines
 
+언어 규칙: 주석과 답변은 모두 한글로 달아주세요.
+
 ## Project Structure & Module Organization
 - `app/` hosts the Android application module; Kotlin sources live under `app/src/main/java/cc/ggrip/movenet` and are grouped by feature folders such as `ui`, `tflite`, `pose`, `util`, and `bench`.
 - `app/src/main/res` stores XML layouts, drawables, and strings; keep resources close to the fragment or activity that consumes them.

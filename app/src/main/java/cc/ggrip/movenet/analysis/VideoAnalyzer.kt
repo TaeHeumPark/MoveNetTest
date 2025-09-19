@@ -91,7 +91,7 @@ class VideoAnalyzer(private val context: Context) {
     private fun createAnalyzer(engine: Engine, tier: Tier): PoseFrameAnalyzer {
         return when (engine) {
             Engine.MOVENET -> MoveNetVideoAnalyzer(context, ModelAssets.movenetPath(tier))
-            Engine.MEDIAPIPE -> MediaPipeVideoAnalyzer(context, ModelAssets.mpTaskPath(tier), Delegate.CPU)
+            Engine.MEDIAPIPE -> MediaPipeVideoAnalyzer(context, ModelAssets.mpTaskPath(tier), Delegate.GPU)
         }
     }
 }

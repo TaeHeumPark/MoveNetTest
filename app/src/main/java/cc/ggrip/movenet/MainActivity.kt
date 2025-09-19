@@ -25,7 +25,7 @@ class MainActivity : AppCompatActivity() {
         ModelItem("MediaPipe - heavy", Engine.MEDIAPIPE, Tier.HEAVY)
     )
 
-    private var selectedIndex = 1 // 기본: MoveNet thunder
+    private var selectedIndex = 3 // 기본: MediaPipe - full
     private var isVideoMode = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -115,7 +115,7 @@ class MainActivity : AppCompatActivity() {
         invalidateOptionsMenu()
         supportActionBar?.title = getString(R.string.video_analysis_title)
         supportFragmentManager.commit {
-            replace(R.id.fragmentContainer, VideoAnalysisFragment.newInstance())
+            replace(R.id.fragmentContainer, VideoAnalysisFragment.newInstance()) // ✅ newInstance 사용
         }
     }
 }

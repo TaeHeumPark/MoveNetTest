@@ -1,15 +1,19 @@
 <resources>
     <string name="app_name">MoveNet</string>
-    <string name="hello_blank_fragment">Hello blank fragment</string>
-    <string name="video_select_button">동영상 선택</string>
-    <string name="video_select_placeholder">선택된 파일이 없습니다</string>
-    <string name="video_analyze_button">분석 시작</string>
-    <string name="video_segment_placeholder">분석 후 세그먼트가 표시됩니다</string>
-    <string name="video_progress_format">%1$d / %2$d 프레임</string>
-    <string name="video_segment_summary">스윙 세그먼트: %1$.2f초 ~ %2$.2f초 (총 %3$.2f초)</string>
-    <string name="video_segment_none">스윙 세그먼트를 찾지 못했습니다</string>
-    <string name="video_error_select_first">먼저 동영상을 선택하세요</string>
-    <string name="video_error_generic">분석 중 문제가 발생했습니다</string>
-    <string name="video_analysis_title">비디오 분석</string>
+    <string name="video_select_placeholder">선택된 영상이 없습니다</string>
+    <string name="video_segment_placeholder">검출된 세그먼트가 여기에 표시됩니다</string>
+    <string name="video_progress_format">%1 / %2 프레임</string>
+    <string name="video_segment_summary">선택한 세그먼트: %1$.2f초 ~ %2$.2f초 (총 %3$.2f초)</string>
+    <string name="video_segment_none">세그먼트를 찾지 못했습니다</string>
+    <string name="video_error_select_first">먼저 분석할 영상을 선택해 주세요</string>
+    <string name="video_error_generic">분석 도중 오류가 발생했습니다</string>
+    <string name="video_error_too_long">최대 1시간 이하의 영상만 분석할 수 있습니다</string>
+    <string name="video_analysis_title">영상 분석</string>
     <string name="video_toggle_realtime">실시간 모드</string>
+    <string name="video_analyze_start">분석 시작</string>
+    <string name="video_prev_frame">이전 프레임</string>
+    <string name="video_next_frame">다음 프레임</string>
+    <string name="video_action_select">영상 선택</string>
+    <string name="video_analyze_complete">분석 완료: %1 세그먼트</string>
+    <string name="video_progress_phase">%1 %2%%</string>
 </resources>
