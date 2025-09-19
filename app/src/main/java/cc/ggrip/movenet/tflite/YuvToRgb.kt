@@ -133,15 +133,5 @@ object ImageUtil {
         vBuffer.position(vPos)
     }
 
-    fun yuv420ThreePlanesToNV21(
-        planes: Array<Image.Plane>,
-        width: Int,
-        height: Int
-    ): ByteArray {
-        val imageSize = width * height
-        val out = ByteArray(imageSize + 2 * (imageSize / 4))
-        yuv420ThreePlanesToNV21(planes, width, height, out)
-        return out
-    }
 }
 

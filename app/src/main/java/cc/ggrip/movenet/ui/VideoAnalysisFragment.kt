@@ -92,6 +92,7 @@ class VideoAnalysisFragment : Fragment() {
     // 추론 프레임률(리콜↑)
     private val TARGET_INFER_FPS = 20         // 15 → 20
     private val STEP_MS = 1000L / TARGET_INFER_FPS
+    private val USE_PREPASS = false
 
     // 영상 단일 선택
     private val pickVideo = registerForActivityResult(
@@ -270,16 +271,26 @@ class VideoAnalysisFragment : Fragment() {
 
             try {
                 // 1) 프리패스
-                val windows = coarseMotionWindows(uri) { processedMs, totalMs ->
-                    withContext(Dispatchers.Main) {
-                        val pct = if (totalMs > 0) (processedMs * 100 / totalMs).toInt() else 0
-                        setProgress(pct.coerceIn(0, 100), "프리패스 진행...$pct%")
-                        segmentBar.setPosition(processedMs)
+                val windows = if (USE_PREPASS) {
+                    coarseMotionWindowsFast(uri) { processedMs, totalMs ->
+                        withContext(Dispatchers.Main) {
+                            val pct = if (totalMs > 0) (processedMs * 100 / totalMs).toInt() else 0
+                            setProgress(pct.coerceIn(0, 100), "프리패스 진행...$pct%")
+                            segmentBar.setPosition(processedMs)
+                        }
                     }
+                } else {
+                    // 프리패스 생략: 전체 구간 한 번에
+                    val dur = readVideoInfo(requireContext(), uri).durationMs
+                    withContext(Dispatchers.Main) {
+                        setProgress(100, "프리패스 건너뜀")
+                        segmentBar.setPosition(0L)
+                    }
+                    listOf(0L to dur)
                 }
 
                 // 2) 본분석
-                val segments = analyzeSwingSegments(uri, windows) { processedMs, totalMs ->
+                val segments = analyzeSwingSegments(uri, windows, detector) { processedMs, totalMs ->
                     withContext(Dispatchers.Main) {
                         val pct = if (totalMs > 0) (processedMs * 100 / totalMs).toInt() else 0
                         setProgress(pct.coerceIn(0, 100), "분석 중...$pct%")
@@ -335,6 +346,240 @@ class VideoAnalysisFragment : Fragment() {
     // -----------------------------
     // 1) 프리패스: 저해상도/저FPS로 모션 구간 찾기
     // -----------------------------
+    @SuppressLint("Recycle")
+    private suspend fun coarseMotionWindowsFast(
+        uri: Uri,
+        onProgress: suspend (processedMs: Long, totalMs: Long) -> Unit = { _, _ -> }
+    ): List<Pair<Long, Long>> {
+
+        fun pickSwH264(): String {
+            val prefer = listOf("c2.android.avc.decoder", "OMX.google.h264.decoder")
+            val infos = MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos
+            return infos.firstOrNull { info ->
+                !info.isEncoder &&
+                        info.supportedTypes.any { it.equals("video/avc", true) } &&
+                        info.name in prefer
+            }?.name ?: error("No software H.264 decoder found")
+        }
+
+        // 프리패스 파라미터 (저비용)
+        val preStepMs = 200L                 // ≈5fps만 본다(충분)
+        val ySampleStep = 16                 // Y평면 16픽셀 간격 샘플
+        val yDiffThr = 12                    // 밝기 차 임계(0~255)
+        val motionRatioThr = diffThreshold   // 기존 임계 재사용(0.05f 등)
+
+        val info = readVideoInfo(requireContext(), uri)
+        val durMs = info.durationMs
+        onProgress(0L, durMs)
+
+        val windows = mutableListOf<Pair<Long, Long>>()
+        var inMotion = false
+        var winStart = 0L
+        var lastMotionMs = -1L
+
+        val extractor = MediaExtractor()
+        var codec: MediaCodec? = null
+        try {
+            extractor.setDataSource(requireContext(), uri, null)
+
+            // 비디오 트랙
+            var track = -1
+            var format: MediaFormat? = null
+            for (i in 0 until extractor.trackCount) {
+                val f = extractor.getTrackFormat(i)
+                val mime = f.getString(MediaFormat.KEY_MIME) ?: ""
+                if (mime.startsWith("video/")) { track = i; format = f; break }
+            }
+            require(track >= 0 && format != null) { "No video track" }
+            extractor.selectTrack(track)
+
+            codec = MediaCodec.createByCodecName(pickSwH264())
+            val caps = codec.codecInfo.getCapabilitiesForType("video/avc")
+            if (caps.colorFormats.contains(MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)) {
+                format!!.setInteger(
+                    MediaFormat.KEY_COLOR_FORMAT,
+                    MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible
+                )
+            }
+            if (Build.VERSION.SDK_INT >= 23) {
+                format!!.setInteger(MediaFormat.KEY_OPERATING_RATE, 240)
+            }
+            codec.configure(format, null, null, 0)
+            codec.start()
+
+            // 범위: 전체
+            extractor.seekTo(0, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+            val endMs = durMs
+
+            val infoBuf = MediaCodec.BufferInfo()
+            var inputDone = false
+            var outputDone = false
+
+            var lastCheckedMs = Long.MIN_VALUE
+            var prevGrid: IntArray? = null
+            var prevGridW = 0
+            var prevGridH = 0
+
+            var lastOutputWall = android.os.SystemClock.elapsedRealtime()
+
+            while (!outputDone && coroutineContext.isActive) {
+                // 입력
+                if (!inputDone) {
+                    val inIx = codec.dequeueInputBuffer(10_000)
+                    if (inIx >= 0) {
+                        val ib = codec.getInputBuffer(inIx)!!
+                        val sampleTimeUs = extractor.sampleTime
+                        val curMs = if (sampleTimeUs >= 0) sampleTimeUs / 1000L else -1L
+
+                        if (sampleTimeUs < 0 || curMs > endMs) {
+                            codec.queueInputBuffer(inIx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            inputDone = true
+                        } else {
+                            val sz = extractor.readSampleData(ib, 0)
+                            if (sz < 0) {
+                                codec.queueInputBuffer(inIx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                inputDone = true
+                            } else {
+                                codec.queueInputBuffer(inIx, 0, sz, sampleTimeUs, 0)
+                                extractor.advance()
+                            }
+                        }
+                    }
+                }
+
+                // 출력
+                val outIx = codec.dequeueOutputBuffer(infoBuf, 10_000)
+                when {
+                    outIx == MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                        if (inputDone && android.os.SystemClock.elapsedRealtime() - lastOutputWall > 2000) {
+                            outputDone = true
+                        }
+                    }
+                    outIx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> Unit
+                    outIx >= 0 -> {
+                        lastOutputWall = android.os.SystemClock.elapsedRealtime()
+                        val tMs = infoBuf.presentationTimeUs / 1000L
+                        val isEos = (infoBuf.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
+
+                        // 5fps만 체크
+                        if (lastCheckedMs != Long.MIN_VALUE && tMs - lastCheckedMs < preStepMs) {
+                            codec.releaseOutputBuffer(outIx, false)
+                            if (isEos || tMs >= endMs) outputDone = true
+                            onProgress(tMs.coerceAtMost(endMs), endMs)
+                            continue
+                        }
+                        lastCheckedMs = tMs
+
+                        codec.getOutputImage(outIx)?.let { img ->
+                            try {
+                                val crop = img.cropRect ?: Rect(0, 0, img.width, img.height)
+                                val y = img.planes[0]
+                                val yBuf = y.buffer
+                                val yRS = y.rowStride
+                                val yPS = y.pixelStride
+
+                                val w = crop.width()
+                                val h = crop.height()
+
+                                val gridW = ((w + ySampleStep - 1) / ySampleStep)
+                                val gridH = ((h + ySampleStep - 1) / ySampleStep)
+                                val curGrid = if (prevGrid == null ||
+                                    prevGridW != gridW || prevGridH != gridH) {
+                                    IntArray(gridW * gridH)
+                                } else IntArray(gridW * gridH)
+
+                                var gi = 0
+                                var changed = 0
+                                var total = 0
+
+                                var yy = 0
+                                while (yy < h) {
+                                    val yRowBase = (yy + crop.top) * yRS + crop.left * yPS
+                                    var xx = 0
+                                    while (xx < w) {
+                                        val yIx = yRowBase + xx * yPS
+                                        val Y = yBuf.get(yIx).toInt() and 0xFF
+                                        curGrid[gi] = Y
+
+                                        if (prevGrid != null &&
+                                            prevGridW == gridW && prevGridH == gridH) {
+                                            val diff = kotlin.math.abs(Y - prevGrid!![gi])
+                                            if (diff > yDiffThr) changed++
+                                            total++
+                                        }
+                                        gi++
+                                        xx += ySampleStep
+                                    }
+                                    yy += ySampleStep
+                                }
+
+                                // 모션 비율
+                                val ratio = if (total == 0) 0f else changed.toFloat() / total
+
+                                if (ratio > motionRatioThr) {
+                                    if (!inMotion) {
+                                        inMotion = true
+                                        winStart = (tMs - preStepMs).coerceAtLeast(0L)
+                                    }
+                                    lastMotionMs = tMs
+                                } else {
+                                    if (inMotion && lastMotionMs >= 0 && (tMs - lastMotionMs) >= (preStepMs * 2)) {
+                                        val rawStart = winStart
+                                        val rawEnd = lastMotionMs
+                                        if (rawEnd - rawStart >= minWindowMs) {
+                                            windows += ((rawStart - padWindowMs).coerceAtLeast(0L)) to
+                                                    ((rawEnd + padWindowMs).coerceAtMost(durMs))
+                                        }
+                                        inMotion = false
+                                        lastMotionMs = -1L
+                                    }
+                                }
+
+                                // prev 그리드 보관
+                                prevGrid = curGrid
+                                prevGridW = gridW
+                                prevGridH = gridH
+
+                                onProgress(tMs.coerceAtMost(endMs), endMs)
+                            } finally {
+                                img.close()
+                            }
+                        }
+
+                        codec.releaseOutputBuffer(outIx, false)
+                        if (isEos || tMs >= endMs) outputDone = true
+                    }
+                }
+            }
+        } finally {
+            runCatching { codec?.stop() }
+            runCatching { codec?.release() }
+            runCatching { extractor.release() }
+        }
+
+        // 열린 윈도우 마감
+        if (inMotion) {
+            val rawStart = winStart
+            val rawEnd = (lastMotionMs.takeIf { it >= 0 } ?: durMs)
+            if (rawEnd - rawStart >= minWindowMs) {
+                windows += ((rawStart - padWindowMs).coerceAtLeast(0L)) to
+                        ((rawEnd + padWindowMs).coerceAtMost(durMs))
+            }
+        }
+
+        // 병합
+        if (windows.size <= 1) return windows
+        val merged = mutableListOf<Pair<Long, Long>>()
+        var (cs, ce) = windows.first()
+        for (i in 1 until windows.size) {
+            val (ns, ne) = windows[i]
+            if (ns - ce <= mergeGapMs) ce = max(ce, ne) else { merged += cs to ce; cs = ns; ce = ne }
+        }
+        merged += cs to ce
+        return merged
+    }
+
+
     private suspend fun coarseMotionWindows(
         uri: Uri,
         onProgress: suspend (processedMs: Long, totalMs: Long) -> Unit = { _, _ -> }
@@ -485,6 +730,7 @@ class VideoAnalysisFragment : Fragment() {
     private suspend fun analyzeSwingSegments(
         uri: Uri,
         windows: List<Pair<Long, Long>>,
+        detector: PoseDetector,
         onProgress: suspend (processedMs: Long, totalMs: Long) -> Unit = { _, _ -> }
     ): List<Pair<Long, Long>> {
 
@@ -567,63 +813,73 @@ class VideoAnalysisFragment : Fragment() {
                     endMsInclusive = we,
                     targetWidth = targetW,
                     targetHeight = targetH,
+                    frameStepMs = STEP_MS,
                     reuseBitmap = reuse,
-                    // frameStepMs는 기본값(약 15fps) 사용해도 OK. 원본 코드도 step 없이 동작.
                     onFrame = { tMs, bmp ->
                         if (tMs <= lastInferMs) return@decodeRangeToBitmapFrames
                         lastInferMs = tMs
 
-                        val mpImg = com.google.mediapipe.framework.image.BitmapImageBuilder(bmp).build()
-                        val result = try { landmarker.detectForVideo(mpImg, tMs) } finally { mpImg.close() }
-                        val pose = result?.landmarks()?.firstOrNull()
-                        if (pose == null || pose.size < 33) {
+                        // 👇👇 여기부터 detector 사용 (이 줄 ~ 아래 onProgress 까지 붙여넣기)
+                        val lm = detector.detect(bmp, tMs) ?: run {
                             onProgress(tMs.coerceAtMost(info.durationMs), info.durationMs)
                             return@decodeRangeToBitmapFrames
                         }
 
-                        fun lm(i: Int) = pose[i]
-                        val lShoulder = lm(11); val rShoulder = lm(12)
-                        val lHip = lm(23);     val rHip = lm(24)
-                        val rWrist = lm(16)
+                        val xs = lm.xs
+                        val ys = lm.ys
 
-                        val midShoulderX = (lShoulder.x() + rShoulder.x()) * 0.5f
-                        val midHipY = (lHip.y() + rHip.y()) * 0.5f
-                        // val shoulderSpan = kotlin.math.abs(rShoulder.x() - lShoulder.x()).coerceAtLeast(1e-3f)
+                        // MP(33포인트) vs MoveNet(17포인트) 인덱스 매핑
+                        val (iLS, iRS, iLH, iRH) =
+                            if (xs.size >= 33) intArrayOf(11, 12, 23, 24) else intArrayOf(5, 6, 11, 12)
 
-                        // 좌우 반전 보정(X만)
-                        val isMirrored = lShoulder.x() > rShoulder.x()
-                        val wx = if (isMirrored) 1f - rWrist.x() else rWrist.x()
+                        val lShoulderX = xs.getOrNull(iLS) ?: 0.5f
+                        val rShoulderX = xs.getOrNull(iRS) ?: 0.5f
+                        val midShoulderX = (lShoulderX + rShoulderX) * 0.5f
+
+                        val lHipY = ys.getOrNull(iLH) ?: 0.5f
+                        val rHipY = ys.getOrNull(iRH) ?: 0.5f
+                        val midHipY = (lHipY + rHipY) * 0.5f
+
+                        // 오른손 손목(없으면 왼손/손가락으로 폴백)
+                        val rWx0 = lm.rWristX ?: lm.rHandX ?: lm.lWristX ?: lm.lHandX
+                        val rWy0 = lm.rWristY ?: lm.rHandY ?: lm.lWristY ?: lm.lHandY
+                        if (rWx0 == null || rWy0 == null) {
+                            onProgress(tMs.coerceAtMost(info.durationMs), info.durationMs)
+                            return@decodeRangeToBitmapFrames
+                        }
+
+                        // 좌우반전 보정
+                        val isMirrored = lm.isMirrored
+                        val wx = if (isMirrored) 1f - rWx0 else rWx0
                         val cx = if (isMirrored) 1f - midShoulderX else midShoulderX
-                        val wy = rWrist.y()
+                        val wy = rWy0
 
                         // TOP 힌트 갱신
                         if (yCount < yHist.size) yHist[yCount++] = wy
-                        else { for (i in 1 until yHist.size) yHist[i-1] = yHist[i]; yHist[yHist.lastIndex] = wy }
+                        else { for (i in 1 until yHist.size) yHist[i - 1] = yHist[i]; yHist[yHist.lastIndex] = wy }
                         if (atLocalTop()) lastTopMs = tMs
 
                         val pT = prevT; val pWx = prevWxRel; val pWy = prevWy
                         if (pT != null && pWx != null && pWy != null) {
                             val dt = (tMs - pT).coerceAtLeast(1L).toFloat()
-                            // val vxPx = (((wx - cx) - pWx) * targetW) * (1000f / dt)   // (참고용)
-                            val vyPx = ((wy - pWy) * targetH) * (1000f / dt)            // ↓ 방향 px/s
+                            val vyPx = ((wy - pWy) * targetH) * (1000f / dt) // ↓ px/s
 
-                            // 임팩트 트리거: 최근 TOP 이후 + 힙밴드 위→안 통과 + 충분한 ↓속도
                             val hipBot = midHipY - hipBandTol
                             val hipTop = midHipY + hipBandTol
-                            val hadTopRecently = (lastTopMs != Long.MIN_VALUE) && (tMs - lastTopMs in minTopToImpactMs..maxTopToImpactMs)
+                            val hadTopRecently = (lastTopMs != Long.MIN_VALUE) &&
+                                    (tMs - lastTopMs in minTopToImpactMs..maxTopToImpactMs)
                             val wasAboveHip = pWy < hipBot
-                            val nowInHip    = wy >= hipBot && wy <= hipTop
+                            val nowInHip = wy >= hipBot && wy <= hipTop
                             val crossingDownIntoHip = wasAboveHip && nowInHip
 
                             if (tMs >= cooldownUntilMs &&
                                 hadTopRecently &&
                                 crossingDownIntoHip &&
-                                vyPx > downMinSpeedPx) {
-
+                                vyPx > downMinSpeedPx
+                            ) {
                                 val segStart = (tMs - preMs).coerceAtLeast(ws)
-                                val segEnd   = (tMs + postMs).coerceAtMost(we)
+                                val segEnd = (tMs + postMs).coerceAtMost(we)
 
-                                // 인접(≤150ms) 세그먼트 병합
                                 if (segments.isNotEmpty() && segStart <= segments.last().second + 150L) {
                                     val last = segments.removeLast()
                                     segments += (last.first to max(last.second, segEnd))
@@ -639,6 +895,7 @@ class VideoAnalysisFragment : Fragment() {
                         prevWy = wy
 
                         onProgress(tMs.coerceAtMost(info.durationMs), info.durationMs)
+                        // 👆👆 여기까지가 교체 영역
                     }
                 )
             }
@@ -684,8 +941,8 @@ class VideoAnalysisFragment : Fragment() {
         endMsInclusive: Long,
         targetWidth: Int,
         targetHeight: Int,
-        reuseBitmap: Bitmap,
-        frameStepMs: Long = 66L,
+        reuseBitmap: Bitmap,               // 반드시 ARGB_8888, 재사용 버퍼
+        frameStepMs: Long = 66L,           // 전달 안 하면 ~15fps
         onFrame: suspend (timestampMs: Long, bitmap: Bitmap) -> Unit,
         onProgress: suspend (curMs: Long, endMs: Long) -> Unit = { _, _ -> }
     ) {
@@ -702,20 +959,27 @@ class VideoAnalysisFragment : Fragment() {
         val extractor = MediaExtractor()
         var codec: MediaCodec? = null
 
+        // RenderScript YUV→RGB 변환기 (실시간과 동일한 클래스 재사용)
+        val rsYuv = cc.ggrip.movenet.tflite.YuvToRgb(context.applicationContext)
+
+        // target(분석 해상도) 버퍼 재사용
         var targetBmp =
-            if (!reuseBitmap.isRecycled
-                && reuseBitmap.config == Bitmap.Config.ARGB_8888
-                && reuseBitmap.isMutable
-                && reuseBitmap.width == targetWidth
-                && reuseBitmap.height == targetHeight
+            if (!reuseBitmap.isRecycled &&
+                reuseBitmap.config == Bitmap.Config.ARGB_8888 &&
+                reuseBitmap.isMutable &&
+                reuseBitmap.width == targetWidth &&
+                reuseBitmap.height == targetHeight
             ) reuseBitmap
             else Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
 
-        var scratchPixels: IntArray? = null
+        // 소스 해상도용 임시 ARGB 비트맵 (매 프레임 재사용)
+        var srcArgb: Bitmap? = null
+        var canvas: Canvas? = null
 
         try {
             extractor.setDataSource(context, uri, null)
 
+            // 비디오 트랙 선택
             var track = -1
             var format: MediaFormat? = null
             for (i in 0 until extractor.trackCount) {
@@ -726,6 +990,7 @@ class VideoAnalysisFragment : Fragment() {
             require(track >= 0 && format != null) { "No video track" }
             extractor.selectTrack(track)
 
+            // 디코더 생성/설정
             codec = MediaCodec.createByCodecName(pickSwH264())
             val caps = codec.codecInfo.getCapabilitiesForType("video/avc")
             if (caps.colorFormats.contains(MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)) {
@@ -734,22 +999,28 @@ class VideoAnalysisFragment : Fragment() {
                     MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible
                 )
             }
+            // 빠른 디코드 힌트 (안드로이드 23+)
             if (Build.VERSION.SDK_INT >= 23) {
+                // 240은 안전한 값. 기기에 따라 480/960도 잘 먹습니다.
                 format!!.setInteger(MediaFormat.KEY_OPERATING_RATE, 240)
             }
-            codec.configure(format, null, null, 0)
+            codec.configure(format, /*surface*/ null, null, 0)
             codec.start()
 
+            // 범위 보정 및 시킹
             val endMs = endMsInclusive + 16
             extractor.seekTo(startMs * 1000L, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
 
             val info = MediaCodec.BufferInfo()
             var inputDone = false
             var outputDone = false
+
+            var lastDeliveredMs = Long.MIN_VALUE   // onFrame으로 보낸 마지막 타임스탬프
+
             var lastOutputWallMs = android.os.SystemClock.elapsedRealtime()
 
             while (!outputDone && coroutineContext.isActive) {
-                // input
+                // 입력
                 if (!inputDone) {
                     val inIx = codec.dequeueInputBuffer(10_000)
                     if (inIx >= 0) {
@@ -773,10 +1044,11 @@ class VideoAnalysisFragment : Fragment() {
                     }
                 }
 
-                // output
+                // 출력
                 val outIx = codec.dequeueOutputBuffer(info, 10_000)
                 when {
                     outIx == MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                        // 입력 끝났고 2초 넘게 출력 없으면 워치독 탈출
                         if (inputDone && android.os.SystemClock.elapsedRealtime() - lastOutputWallMs > 2000) {
                             outputDone = true
                         }
@@ -787,104 +1059,52 @@ class VideoAnalysisFragment : Fragment() {
                         val tMs = info.presentationTimeUs / 1000L
                         val isEos = (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
 
+                        // 추론 프레임 레이트 다운샘플링 (디코드는 진행해도, 변환/추론은 스킵)
+                        if (lastDeliveredMs != Long.MIN_VALUE && tMs - lastDeliveredMs < frameStepMs) {
+                            codec.releaseOutputBuffer(outIx, false)
+                            if (isEos || tMs >= endMs) outputDone = true
+                            onProgress(tMs.coerceAtMost(endMs), endMs)
+                            continue
+                        }
+
                         codec.getOutputImage(outIx)?.let { img ->
                             try {
                                 val crop = img.cropRect ?: Rect(0, 0, img.width, img.height)
                                 val w = crop.width()
                                 val h = crop.height()
 
-                                if (scratchPixels == null || scratchPixels!!.size < w * h) {
-                                    scratchPixels = IntArray(w * h)
-                                }
-                                val pixels = scratchPixels!!
-
-                                val planes = img.planes
-                                val y = planes[0]; val u = planes[1]; val v = planes[2]
-                                val yRS = y.rowStride; val yPS = y.pixelStride
-                                val uRS = u.rowStride; val uPS = u.pixelStride
-                                val vRS = v.rowStride; val vPS = v.pixelStride
-                                val yBuf = y.buffer;   val uBuf = u.buffer;   val vBuf = v.buffer
-
-                                val sx = crop.left; val sy = crop.top
-                                var yy = 0
-                                while (yy < h) {
-                                    val yOff0 = (yy + sy) * yRS + sx * yPS
-                                    val yOff1 = ((yy + 1).coerceAtMost(h - 1) + sy) * yRS + sx * yPS
-                                    val uvRow = ((yy + sy) / 2)
-                                    val uOffRow = uvRow * uRS
-                                    val vOffRow = uvRow * vRS
-
-                                    var xx = 0
-                                    while (xx < w) {
-                                        val x0 = xx
-                                        val x1 = (xx + 1).coerceAtMost(w - 1)
-
-                                        val yIx00 = yOff0 + x0 * yPS
-                                        val yIx01 = yOff0 + x1 * yPS
-                                        val yIx10 = yOff1 + x0 * yPS
-                                        val yIx11 = yOff1 + x1 * yPS
-
-                                        val uvCol = ((xx + sx) / 2)
-                                        val uIx = uOffRow + uvCol * uPS
-                                        val vIx = vOffRow + uvCol * vPS
-
-                                        val Y00 = (yBuf.get(yIx00).toInt() and 0xFF)
-                                        val Y01 = (yBuf.get(yIx01).toInt() and 0xFF)
-                                        val Y10 = (yBuf.get(yIx10).toInt() and 0xFF)
-                                        val Y11 = (yBuf.get(yIx11).toInt() and 0xFF)
-                                        val U = (uBuf.get(uIx).toInt() and 0xFF)
-                                        val V = (vBuf.get(vIx).toInt() and 0xFF)
-
-                                        fun yuv(yv: Int, u_: Int, v_: Int): Int {
-                                            val c = yv - 16
-                                            val d = u_ - 128
-                                            val e = v_ - 128
-                                            var r = (298 * c + 409 * e + 128) shr 8
-                                            var g = (298 * c - 100 * d - 208 * e + 128) shr 8
-                                            var b = (298 * c + 516 * d + 128) shr 8
-                                            if (r < 0) r = 0 else if (r > 255) r = 255
-                                            if (g < 0) g = 0 else if (g > 255) g = 255
-                                            if (b < 0) b = 0 else if (b > 255) b = 255
-                                            return (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-                                        }
-
-                                        val row0 = yy * w
-                                        pixels[row0 + x0] = yuv(Y00, U, V)
-                                        if (x1 < w) pixels[row0 + x1] = yuv(Y01, U, V)
-                                        if (yy + 1 < h) {
-                                            val row1 = (yy + 1) * w
-                                            pixels[row1 + x0] = yuv(Y10, U, V)
-                                            if (x1 < w) pixels[row1 + x1] = yuv(Y11, U, V)
-                                        }
-
-                                        xx += 2
-                                    }
-                                    yy += 2
+                                // srcArgb 재사용 (RS의 출력 타겟)
+                                if (srcArgb == null || srcArgb!!.isRecycled || srcArgb!!.width != w || srcArgb!!.height != h) {
+                                    srcArgb?.recycle()
+                                    srcArgb = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
                                 }
 
-                                val tmpArgb = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-                                tmpArgb.setPixels(pixels, 0, w, 0, 0, w, h)
+                                // ★ RenderScript로 YUV→RGB (초고속, 루프/픽셀 접근 X)
+                                rsYuv.yuvToRgb(img, srcArgb!!)
 
-                                if (targetBmp.isRecycled
-                                    || targetBmp.config != Bitmap.Config.ARGB_8888
-                                    || !targetBmp.isMutable
-                                    || targetBmp.width != targetWidth
-                                    || targetBmp.height != targetHeight
+                                // targetBmp 보장 + Canvas 재사용
+                                if (targetBmp.isRecycled ||
+                                    targetBmp.config != Bitmap.Config.ARGB_8888 ||
+                                    !targetBmp.isMutable ||
+                                    targetBmp.width != targetWidth ||
+                                    targetBmp.height != targetHeight
                                 ) {
                                     targetBmp = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
+                                    canvas = null
                                 }
+                                val c = (canvas ?: Canvas(targetBmp).also { canvas = it })
 
-                                val canvas = Canvas(targetBmp)
-                                if (tmpArgb.width == targetBmp.width && tmpArgb.height == targetBmp.height) {
-                                    canvas.drawBitmap(tmpArgb, 0f, 0f, null)
+                                // 필요 시 스케일 복사
+                                if (srcArgb!!.width == targetBmp.width && srcArgb!!.height == targetBmp.height) {
+                                    c.drawBitmap(srcArgb!!, 0f, 0f, null)
                                 } else {
-                                    canvas.drawBitmap(tmpArgb, null, Rect(0, 0, targetBmp.width, targetBmp.height), null)
+                                    c.drawBitmap(srcArgb!!, null, Rect(0, 0, targetBmp.width, targetBmp.height), null)
                                 }
 
+                                // 콜백
                                 onFrame(tMs, targetBmp)
-                                onProgress(tMs, endMs)
-
-                                tmpArgb.recycle()
+                                onProgress(tMs.coerceAtMost(endMs), endMs)
+                                lastDeliveredMs = tMs
                             } finally {
                                 img.close()
                             }
@@ -892,8 +1112,6 @@ class VideoAnalysisFragment : Fragment() {
 
                         codec.releaseOutputBuffer(outIx, false)
                         if (isEos || tMs >= endMs) outputDone = true
-
-                        onProgress(tMs.coerceAtMost(endMs), endMs)
                     }
                 }
             }
@@ -901,6 +1119,8 @@ class VideoAnalysisFragment : Fragment() {
             runCatching { codec?.stop() }
             runCatching { codec?.release() }
             runCatching { extractor.release() }
+            runCatching { rsYuv.release() }
+            runCatching { srcArgb?.recycle() }
         }
     }
 
