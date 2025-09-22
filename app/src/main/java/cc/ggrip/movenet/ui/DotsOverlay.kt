@@ -10,6 +10,8 @@ import android.os.SystemClock
 import android.view.View
 import cc.ggrip.movenet.pose.PoseFrame
 import cc.ggrip.movenet.util.LatencyMeter
+import cc.ggrip.movenet.analysis.SwingPhaseAnalysis
+import cc.ggrip.movenet.analysis.GolfSwingPhase
 import kotlin.math.max
 import kotlin.math.min
 
@@ -31,6 +33,10 @@ class DotsOverlay(
 
     @Volatile private var modelLabel: String = "-"
     fun setModelLabel(label: String) { modelLabel = label; postInvalidateOnAnimation() }
+
+    @Volatile private var swingAnalysis: SwingPhaseAnalysis? = null
+    fun updateSwingState(analysis: SwingPhaseAnalysis) { swingAnalysis = analysis; postInvalidateOnAnimation() }
+
     @Volatile private var firstFrameReceivedAtMs: Long = -1L
     @Volatile private var firstUiLatencyMs: Long = -1L
 
@@ -142,6 +148,20 @@ class DotsOverlay(
             fun fmtFr(d: Double) = if (d.isNaN()) "-" else "%.2f".format(d)
             fun fmtMsLong(value: Long) = if (value < 0) "-" else fmtMs(value.toDouble())
 
+            val swingStateText = swingAnalysis?.let { analysis ->
+                val stateKorean = when (analysis.phase) {
+                    GolfSwingPhase.ADDRESS -> "어드레스"
+                    GolfSwingPhase.TAKEAWAY -> "테이크어웨이"
+                    GolfSwingPhase.BACKSWING -> "백스윙"
+                    GolfSwingPhase.BACKSWING_TOP -> "백스윙 탑"
+                    GolfSwingPhase.DOWNSWING -> "다운스윙"
+                    GolfSwingPhase.IMPACT -> "임팩트"
+                    GolfSwingPhase.FOLLOW_THROUGH -> "팔로우쓰루"
+                    GolfSwingPhase.FINISH -> "피니시"
+                }
+                "스윙 상태: $stateKorean (신뢰도: ${"%.1f".format(analysis.confidence * 100)}%)"
+            } ?: "스윙 상태: 분석 중..."
+
             val lines = listOf(
                 "$engineLabel • $modelLabel • 목표 ${"%.0f".format(targetFps)} FPS",
                 "가속기: $accelLabel",
@@ -149,7 +169,8 @@ class DotsOverlay(
                 "E2E 평균/95퍼: ${fmtMs(stats.e2eAvg)} / ${fmtMs(stats.e2eP95)} ms",
                 "카메라->UI(최근): ${fmtMsLong(latestE2eMs)} ms",
                 "첫 프레임 지연: ${fmtMsLong(firstUiLatencyMs)} ms",
-                "프레임 지연: ${fmtFr(eAvgF)}프 (평균) | ${fmtFr(eP95F)}프 (95p)"
+                "프레임 지연: ${fmtFr(eAvgF)}프 (평균) | ${fmtFr(eP95F)}프 (95p)",
+                swingStateText
             )
 
             val pad = 12f

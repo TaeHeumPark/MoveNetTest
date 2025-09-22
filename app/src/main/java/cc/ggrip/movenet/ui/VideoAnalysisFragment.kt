@@ -19,6 +19,7 @@ import androidx.annotation.RequiresApi
 import androidx.fragment.app.Fragment
 import androidx.lifecycle.lifecycleScope
 import cc.ggrip.movenet.R
+import cc.ggrip.movenet.analysis.MoveNetVideoAnalyzer
 import cc.ggrip.movenet.bench.Engine
 import cc.ggrip.movenet.bench.ModelAssets
 import cc.ggrip.movenet.bench.Tier
@@ -741,33 +742,38 @@ class VideoAnalysisFragment : Fragment() {
         // 타깃 해상도 선택 (decodeRangeToBitmapFrames와 공유)
         val (targetW, targetH) = chooseTargetSize(info)
 
-        // PoseLandmarker (GPU 우선, 실패 시 CPU) — 모델은 풀(task) 고정
-        val landmarker: PoseLandmarker = run {
-            fun make(delegate: Delegate) =
-                PoseLandmarker.createFromOptions(
-                    requireContext(),
-                    PoseLandmarkerOptions.builder()
-                        .setBaseOptions(
-                            BaseOptions.builder()
-                                .setModelAssetPath("models/pose_landmarker_full.task")
-                                .setDelegate(delegate)
-                                .build()
-                        )
-                        .setRunningMode(RunningMode.VIDEO)
-                        .setNumPoses(1)
-                        .setMinPoseDetectionConfidence(0.4f)
-                        .setMinTrackingConfidence(0.4f)
-                        .setMinPosePresenceConfidence(0.4f)
-                        .build()
-                )
-            try { make(Delegate.GPU) } catch (_: Exception) { make(Delegate.CPU) }
-        }
+        // MediaPipe만 이 방식으로 처리 (MoveNet은 detector에서 처리)
+        val landmarker: PoseLandmarker? = if (detector is MediaPipeTaskDetector) {
+            run {
+                fun make(delegate: Delegate) =
+                    PoseLandmarker.createFromOptions(
+                        requireContext(),
+                        PoseLandmarkerOptions.builder()
+                            .setBaseOptions(
+                                BaseOptions.builder()
+                                    .setModelAssetPath("models/pose_landmarker_full.task")
+                                    .setDelegate(delegate)
+                                    .build()
+                            )
+                            .setRunningMode(RunningMode.VIDEO)
+                            .setNumPoses(1)
+                            .setMinPoseDetectionConfidence(0.4f)
+                            .setMinTrackingConfidence(0.4f)
+                            .setMinPosePresenceConfidence(0.4f)
+                            .build()
+                    )
+                try { make(Delegate.GPU) } catch (_: Exception) { make(Delegate.CPU) }
+            }
+        } else null
 
         // 결과 세그먼트
         val segments = mutableListOf<Pair<Long, Long>>()
 
         // 재사용 비트맵 버퍼 (ARGB_8888)
         val reuse = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
+
+        // 모델 타입 확인
+        val isMoveNet = detector is MoveNetPoseFrameDetector
 
         // TOP 힌트(최근 TOP 이후에만 임팩트 인지)
         val yHist = FloatArray(5)
@@ -778,8 +784,8 @@ class VideoAnalysisFragment : Fragment() {
             return c <= a && c <= b && c <= d && c <= e
         }
         var lastTopMs = Long.MIN_VALUE
-        val minTopToImpactMs = 120L
-        val maxTopToImpactMs = 1400L
+        val minTopToImpactMs = if (isMoveNet) 100L else 120L
+        val maxTopToImpactMs = if (isMoveNet) 1600L else 1400L // MoveNet은 더 긴 시간 허용
 
         // 상태
         var lastInferMs = Long.MIN_VALUE
@@ -790,8 +796,12 @@ class VideoAnalysisFragment : Fragment() {
 
         // 임팩트 중심 세그먼트 길이 & 임계치
         val longEdge = max(targetW, targetH).toFloat()
-        val downMinSpeedPx = max(220f, longEdge * 0.22f) // ↓속도(다운스윙) 최소
-        val hipBandTol = 0.10f                           // 힙 밴드 허용 폭(정규화 y)
+        val downMinSpeedPx = if (isMoveNet) {
+            max(150f, longEdge * 0.15f) // MoveNet은 더 낮은 임계값
+        } else {
+            max(220f, longEdge * 0.22f) // MediaPipe 기존 임계값
+        }
+        val hipBandTol = if (isMoveNet) 0.15f else 0.10f // MoveNet은 더 넓은 허용 범위
         val preMs  = 1000L                               // 임팩트 이전
         val postMs = 2200L                               // 임팩트 이후
         val cooldownMs = 900L
@@ -819,7 +829,7 @@ class VideoAnalysisFragment : Fragment() {
                         if (tMs <= lastInferMs) return@decodeRangeToBitmapFrames
                         lastInferMs = tMs
 
-                        // 👇👇 여기부터 detector 사용 (이 줄 ~ 아래 onProgress 까지 붙여넣기)
+                        // detector 사용하여 포즈 감지
                         val lm = detector.detect(bmp, tMs) ?: run {
                             onProgress(tMs.coerceAtMost(info.durationMs), info.durationMs)
                             return@decodeRangeToBitmapFrames
@@ -827,6 +837,14 @@ class VideoAnalysisFragment : Fragment() {
 
                         val xs = lm.xs
                         val ys = lm.ys
+
+                        // 디버깅: 포즈 데이터 로그
+                        if (tMs % 5000L == 0L) { // 5초마다 로그
+                            val detectorType = if (detector is MoveNetPoseFrameDetector) "MoveNet" else "MediaPipe"
+                            Log.d("PoseDebug", "$detectorType at ${tMs}ms: ${xs.size} points")
+                            Log.d("PoseDebug", "  rWrist: (${lm.rWristX}, ${lm.rWristY})")
+                            Log.d("PoseDebug", "  isMirrored: ${lm.isMirrored}")
+                        }
 
                         // MP(33포인트) vs MoveNet(17포인트) 인덱스 매핑
                         val (iLS, iRS, iLH, iRH) =
@@ -880,6 +898,9 @@ class VideoAnalysisFragment : Fragment() {
                                 val segStart = (tMs - preMs).coerceAtLeast(ws)
                                 val segEnd = (tMs + postMs).coerceAtMost(we)
 
+                                val detectorType = if (detector is MoveNetPoseFrameDetector) "MoveNet" else "MediaPipe"
+                                Log.d("SwingDetected", "$detectorType swing at ${tMs}ms: vyPx=$vyPx, downMinSpeedPx=$downMinSpeedPx")
+
                                 if (segments.isNotEmpty() && segStart <= segments.last().second + 150L) {
                                     val last = segments.removeLast()
                                     segments += (last.first to max(last.second, segEnd))
@@ -887,6 +908,14 @@ class VideoAnalysisFragment : Fragment() {
                                     segments += (segStart to segEnd)
                                 }
                                 cooldownUntilMs = tMs + cooldownMs
+                            } else {
+                                // 디버깅: 조건 미충족 이유
+                                if (tMs % 2000L == 0L) { // 2초마다
+                                    val detectorType = if (detector is MoveNetPoseFrameDetector) "MoveNet" else "MediaPipe"
+                                    Log.d("SwingCondition", "$detectorType at ${tMs}ms: cooldown=${tMs >= cooldownUntilMs}, " +
+                                            "recentTop=$hadTopRecently, crossing=$crossingDownIntoHip, " +
+                                            "speed=$vyPx>$downMinSpeedPx, wasAbove=$wasAboveHip")
+                                }
                             }
                         }
 
@@ -926,7 +955,7 @@ class VideoAnalysisFragment : Fragment() {
                 Toast.makeText(requireContext(), e.message ?: "분석 중 오류", Toast.LENGTH_LONG).show()
             }
         } finally {
-            runCatching { landmarker.close() }
+            runCatching { landmarker?.close() }
         }
 
         return segments
@@ -1101,8 +1130,18 @@ class VideoAnalysisFragment : Fragment() {
                                     c.drawBitmap(srcArgb!!, null, Rect(0, 0, targetBmp.width, targetBmp.height), null)
                                 }
 
-                                // 콜백
-                                onFrame(tMs, targetBmp)
+                                // 안전한 새 비트맵 생성 (재활용 문제 방지)
+                                val safeBitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
+                                val safeCanvas = Canvas(safeBitmap)
+
+                                // 필요 시 스케일 복사 (안전한 비트맵으로)
+                                if (srcArgb!!.width == targetWidth && srcArgb!!.height == targetHeight) {
+                                    safeCanvas.drawBitmap(srcArgb!!, 0f, 0f, null)
+                                } else {
+                                    safeCanvas.drawBitmap(srcArgb!!, null, Rect(0, 0, targetWidth, targetHeight), null)
+                                }
+
+                                onFrame(tMs, safeBitmap)
                                 onProgress(tMs.coerceAtMost(endMs), endMs)
                                 lastDeliveredMs = tMs
                             } finally {
@@ -1182,7 +1221,7 @@ class VideoAnalysisFragment : Fragment() {
     private fun createDetector(mi: ModelItem): PoseDetector {
         return when (mi.engine) {
             Engine.MEDIAPIPE -> MediaPipeTaskDetector(requireContext(), ModelAssets.mpTaskPath(mi.tier))
-            Engine.MOVENET   -> MoveNetDetector(requireContext(), ModelAssets.movenetPath(mi.tier), mi.tier)
+            Engine.MOVENET   -> MoveNetPoseFrameDetector(requireContext(), ModelAssets.movenetPath(mi.tier), mi.tier)
         }
     }
 
@@ -1237,65 +1276,176 @@ class VideoAnalysisFragment : Fragment() {
         override fun close() { runCatching { landmarker.close() } }
     }
 
-    private class MoveNetDetector(
+    private class MoveNetPoseFrameDetector(
         private val ctx: Context,
         private val assetModelPath: String,
         private val tier: Tier
     ) : PoseDetector {
-        private val interpreter: org.tensorflow.lite.Interpreter by lazy {
-            org.tensorflow.lite.Interpreter(loadModelFile(ctx, assetModelPath))
+
+        private val interpreter: Interpreter
+        private val inputSize: Int
+        private val isQuantized: Boolean
+
+        init {
+            // TensorFlow Lite 모델 직접 로드
+            val model = loadModelBuffer(ctx, assetModelPath)
+            val options = Interpreter.Options().apply {
+                setUseXNNPACK(true)
+                setNumThreads(Runtime.getRuntime().availableProcessors().coerceAtMost(4))
+            }
+            interpreter = Interpreter(model, options)
+
+            // 입력 텐서 정보 확인
+            val inputTensor = interpreter.getInputTensor(0)
+            val shape = inputTensor.shape()
+            inputSize = shape[1] // [1, 192, 192, 3] 또는 [1, 256, 256, 3]
+            isQuantized = inputTensor.dataType() == org.tensorflow.lite.DataType.UINT8
+
+            // 텐서 할당
+            interpreter.allocateTensors()
+
+            Log.d("MoveNetDirect", "Model loaded: inputSize=$inputSize, quantized=$isQuantized")
         }
-        private val inputSize = if (tier == Tier.LIGHT) 192 else 256
-        private val imgBuffer = FloatArray(inputSize * inputSize * 3)
 
         override fun detect(bmp: Bitmap, tMs: Long): Landmarks? {
-            val size = minOf(bmp.width, bmp.height)
-            val left = (bmp.width - size) / 2
-            val top  = (bmp.height - size) / 2
-            val square = Bitmap.createBitmap(bmp, left, top, size, size)
-            val input = Bitmap.createScaledBitmap(square, inputSize, inputSize, false)
-            square.recycle()
-
-            val px = IntArray(input.width * input.height)
-            input.getPixels(px, 0, input.width, 0, 0, input.width, input.height)
-            var o = 0
-            for (p in px) {
-                imgBuffer[o++] = ((p shr 16) and 0xFF) / 255f
-                imgBuffer[o++] = ((p shr 8) and 0xFF) / 255f
-                imgBuffer[o++] = (p and 0xFF) / 255f
+            if (bmp.isRecycled) {
+                Log.w("MoveNetDirect", "Received recycled bitmap")
+                return null
             }
-            input.recycle()
 
-            // Output [1,1,17,3] (y,x,score)
-            val out = Array(1) { Array(1) { Array(17) { FloatArray(3) } } }
-            return try {
-                interpreter.run(imgBuffer, out)
-                val kps = out[0][0]
-                val n = kps.size
-                val xs = FloatArray(n) { i -> kps[i][1].coerceIn(0f,1f) }
-                val ys = FloatArray(n) { i -> kps[i][0].coerceIn(0f,1f) }
+            try {
+                // 1. 정사각형 크롭 (자체 구현으로 bitmap recycling 방지)
+                val square = cropToSquare(bmp)
 
-                // COCO: 9 LShoulder,10 RShoulder, 9? (movenet variants differ) — 보편 매핑:
-                // 5 LShoulder, 6 RShoulder, 9 LWrist, 10 RWrist (모델별 조금 다를 수 있음)
+                // 2. 리사이즈
+                val resized = Bitmap.createScaledBitmap(square, inputSize, inputSize, true)
+                if (square !== bmp) square.recycle()
+
+                // 3. 입력 버퍼 준비
+                val inputBuffer = if (isQuantized) {
+                    prepareInputUInt8(resized)
+                } else {
+                    prepareInputFloat32(resized)
+                }
+                resized.recycle()
+
+                // 4. 출력 버퍼 준비 (17 keypoints * 3: y, x, confidence)
+                val outputArray = Array(1) { Array(1) { Array(17) { FloatArray(3) } } }
+
+                // 5. 추론 실행
+                interpreter.run(inputBuffer, outputArray)
+
+                // 6. 결과 변환
+                val keypoints = outputArray[0][0]
+                val xs = FloatArray(17)
+                val ys = FloatArray(17)
+
+                for (i in 0 until 17) {
+                    ys[i] = keypoints[i][0].coerceIn(0f, 1f)
+                    xs[i] = keypoints[i][1].coerceIn(0f, 1f)
+                }
+
+                // 디버깅 로그
+                if (tMs % 5000L == 0L) {
+                    Log.d("MoveNetDirect", "Detection result at ${tMs}ms: valid keypoints detected")
+                }
+
+                // MoveNet COCO-17 인덱스
                 val iLShoulder = 5; val iRShoulder = 6
-                val iLWrist = 9;   val iRWrist = 10
+                val iLWrist = 9; val iRWrist = 10
 
                 val isMirrored = xs[iLShoulder] > xs[iRShoulder]
                 val lWx = xs[iLWrist]; val lWy = ys[iLWrist]
                 val rWx = xs[iRWrist]; val rWy = ys[iRWrist]
 
-                // MoveNet에는 hand index가 없음 → wrist로 대체
-                Landmarks(xs, ys, lWx, lWy, rWx, rWy, lWx, lWy, rWx, rWy, isMirrored)
-            } catch (_: Throwable) { null }
+                return Landmarks(xs, ys, lWx, lWy, rWx, rWy, lWx, lWy, rWx, rWy, isMirrored)
+
+            } catch (e: Exception) {
+                Log.e("MoveNetDirect", "Detection failed at ${tMs}ms", e)
+                return null
+            }
         }
 
-        override fun close() { runCatching { interpreter.close() } }
+        private fun cropToSquare(bitmap: Bitmap): Bitmap {
+            val size = minOf(bitmap.width, bitmap.height)
+            val left = (bitmap.width - size) / 2
+            val top = (bitmap.height - size) / 2
 
-        private fun loadModelFile(ctx: Context, assetPath: String): java.nio.MappedByteBuffer {
-            val afd = ctx.assets.openFd(assetPath)
-            java.io.FileInputStream(afd.fileDescriptor).channel.use { ch ->
-                return ch.map(java.nio.channels.FileChannel.MapMode.READ_ONLY, afd.startOffset, afd.length)
+            return if (size == bitmap.width && size == bitmap.height) {
+                bitmap
+            } else {
+                Bitmap.createBitmap(bitmap, left, top, size, size)
+            }
+        }
+
+        private fun prepareInputFloat32(bitmap: Bitmap): java.nio.FloatBuffer {
+            val buffer = java.nio.ByteBuffer.allocateDirect(4 * inputSize * inputSize * 3)
+            buffer.order(java.nio.ByteOrder.nativeOrder())
+            val floatBuffer = buffer.asFloatBuffer()
+
+            val pixels = IntArray(inputSize * inputSize)
+            bitmap.getPixels(pixels, 0, inputSize, 0, 0, inputSize, inputSize)
+
+            for (pixel in pixels) {
+                val r = (pixel shr 16 and 0xFF) / 127.5f - 1.0f
+                val g = (pixel shr 8 and 0xFF) / 127.5f - 1.0f
+                val b = (pixel and 0xFF) / 127.5f - 1.0f
+                floatBuffer.put(r)
+                floatBuffer.put(g)
+                floatBuffer.put(b)
+            }
+
+            floatBuffer.rewind()
+            return floatBuffer
+        }
+
+        private fun prepareInputUInt8(bitmap: Bitmap): java.nio.ByteBuffer {
+            val buffer = java.nio.ByteBuffer.allocateDirect(inputSize * inputSize * 3)
+            buffer.order(java.nio.ByteOrder.nativeOrder())
+
+            val pixels = IntArray(inputSize * inputSize)
+            bitmap.getPixels(pixels, 0, inputSize, 0, 0, inputSize, inputSize)
+
+            for (pixel in pixels) {
+                buffer.put((pixel shr 16 and 0xFF).toByte()) // R
+                buffer.put((pixel shr 8 and 0xFF).toByte())  // G
+                buffer.put((pixel and 0xFF).toByte())        // B
+            }
+
+            buffer.rewind()
+            return buffer
+        }
+
+        private fun loadModelBuffer(context: Context, assetPath: String): java.nio.MappedByteBuffer {
+            return try {
+                context.assets.openFd(assetPath).use { fd ->
+                    FileInputStream(fd.fileDescriptor).use { fis ->
+                        fis.channel.map(
+                            FileChannel.MapMode.READ_ONLY,
+                            fd.startOffset,
+                            fd.declaredLength
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                context.assets.open(assetPath).use { inputStream ->
+                    val bytes = inputStream.readBytes()
+                    java.nio.ByteBuffer.allocateDirect(bytes.size).apply {
+                        order(java.nio.ByteOrder.nativeOrder())
+                        put(bytes)
+                        rewind()
+                    } as java.nio.MappedByteBuffer
+                }
+            }
+        }
+
+        override fun close() {
+            try {
+                interpreter.close()
+            } catch (e: Exception) {
+                Log.e("MoveNetDirect", "Failed to close interpreter", e)
             }
         }
     }
+
 }

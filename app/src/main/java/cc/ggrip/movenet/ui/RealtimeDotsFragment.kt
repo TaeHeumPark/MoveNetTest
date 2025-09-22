@@ -24,6 +24,8 @@ import cc.ggrip.movenet.bench.Tier
 import cc.ggrip.movenet.tflite.MoveNetProcessor
 import cc.ggrip.movenet.util.FpsGovernor
 import cc.ggrip.movenet.util.LatencyMeter
+import cc.ggrip.movenet.analysis.SwingStateAnalyzer
+import cc.ggrip.movenet.analysis.SwingPhaseAnalysis
 import java.util.concurrent.Executors
 
 class RealtimeDotsFragment : Fragment() {
@@ -45,6 +47,7 @@ class RealtimeDotsFragment : Fragment() {
     private lateinit var processor: MoveNetProcessor
     private lateinit var fpsGov: FpsGovernor
     private lateinit var latencyMeter: LatencyMeter
+    private lateinit var swingAnalyzer: SwingStateAnalyzer
     private var targetFps = 30.0
     private var chosenTier: Tier = Tier.MID
 
@@ -63,6 +66,7 @@ class RealtimeDotsFragment : Fragment() {
         chosenTier = arguments?.getString(ARG_TIER)?.let { Tier.valueOf(it) } ?: Tier.MID
         fpsGov = FpsGovernor(targetFps)
         latencyMeter = LatencyMeter()
+        swingAnalyzer = SwingStateAnalyzer()
     }
 
     override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, saved: Bundle?): View {
@@ -93,7 +97,15 @@ class RealtimeDotsFragment : Fragment() {
 
         val assetPath = ModelAssets.movenetPath(chosenTier)
         processor = MoveNetProcessor(requireContext(), { frame ->
-            frame?.let { overlay.post { overlay.update(it) } }
+            frame?.let {
+                // 스윙 상태 분석
+                val swingAnalysis = swingAnalyzer.analyzeSwingState(it)
+
+                overlay.post {
+                    overlay.update(it)
+                    overlay.updateSwingState(swingAnalysis)
+                }
+            }
         }, assetPath)
 
         overlay.setAcceleratorLabel(processor.currentDelegate())

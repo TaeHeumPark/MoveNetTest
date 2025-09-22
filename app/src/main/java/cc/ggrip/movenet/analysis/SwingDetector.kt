@@ -462,10 +462,8 @@ class SwingDetector(
     }
 
     private fun createPoseLandmarker(): PoseLandmarker {
-        val assetPath = when (engine) {
-            Engine.MOVENET -> ModelAssets.mpTaskPath(tier)
-            Engine.MEDIAPIPE -> ModelAssets.mpTaskPath(tier)
-        }
+        // SwingDetector는 MediaPipe만 지원하므로 engine과 무관하게 MediaPipe 경로 사용
+        val assetPath = ModelAssets.mpTaskPath(tier)
         return try {
             PoseLandmarker.createFromOptions(context, landmarkerOptions(assetPath, Delegate.GPU))
         } catch (gpuError: Throwable) {
