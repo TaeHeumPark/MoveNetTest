@@ -77,6 +77,20 @@ class DotsOverlay(
         style = Paint.Style.FILL
     }
 
+    // 스윙 상태 신호등 UI를 위한 페인트
+    private val swingStatePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textSize = 20f
+        textAlign = Paint.Align.CENTER
+    }
+    private val swingIndicatorPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+    }
+    private val swingIndicatorStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2f
+        color = 0xFFFFFFFF.toInt()
+    }
+
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         val W = width.toFloat()
@@ -148,19 +162,8 @@ class DotsOverlay(
             fun fmtFr(d: Double) = if (d.isNaN()) "-" else "%.2f".format(d)
             fun fmtMsLong(value: Long) = if (value < 0) "-" else fmtMs(value.toDouble())
 
-            val swingStateText = swingAnalysis?.let { analysis ->
-                val stateKorean = when (analysis.phase) {
-                    GolfSwingPhase.ADDRESS -> "어드레스"
-                    GolfSwingPhase.TAKEAWAY -> "테이크어웨이"
-                    GolfSwingPhase.BACKSWING -> "백스윙"
-                    GolfSwingPhase.BACKSWING_TOP -> "백스윙 탑"
-                    GolfSwingPhase.DOWNSWING -> "다운스윙"
-                    GolfSwingPhase.IMPACT -> "임팩트"
-                    GolfSwingPhase.FOLLOW_THROUGH -> "팔로우쓰루"
-                    GolfSwingPhase.FINISH -> "피니시"
-                }
-                "스윙 상태: $stateKorean (신뢰도: ${"%.1f".format(analysis.confidence * 100)}%)"
-            } ?: "스윙 상태: 분석 중..."
+            // 스윙 상태 신호등 그리기
+            drawSwingStateIndicator(canvas, W, swingAnalysis)
 
             val lines = listOf(
                 "$engineLabel • $modelLabel • 목표 ${"%.0f".format(targetFps)} FPS",
@@ -169,8 +172,7 @@ class DotsOverlay(
                 "E2E 평균/95퍼: ${fmtMs(stats.e2eAvg)} / ${fmtMs(stats.e2eP95)} ms",
                 "카메라->UI(최근): ${fmtMsLong(latestE2eMs)} ms",
                 "첫 프레임 지연: ${fmtMsLong(firstUiLatencyMs)} ms",
-                "프레임 지연: ${fmtFr(eAvgF)}프 (평균) | ${fmtFr(eP95F)}프 (95p)",
-                swingStateText
+                "프레임 지연: ${fmtFr(eAvgF)}프 (평균) | ${fmtFr(eP95F)}프 (95p)"
             )
 
             val pad = 12f
@@ -197,6 +199,91 @@ class DotsOverlay(
             for (ln in msg) {
                 canvas.drawText(ln, 16f + pad, yText, hudPaint)
                 yText += hudPaint.textSize
+            }
+
+        }
+    }
+
+    private fun drawSwingStateIndicator(canvas: Canvas, screenWidth: Float, analysis: SwingPhaseAnalysis?) {
+        // 스윙 단계들
+        val phases = listOf(
+            GolfSwingPhase.ADDRESS to "어드레스",
+            GolfSwingPhase.TAKEAWAY to "테이크",
+            GolfSwingPhase.BACKSWING to "백스윙",
+            GolfSwingPhase.BACKSWING_TOP to "탑",
+            GolfSwingPhase.DOWNSWING to "다운",
+            GolfSwingPhase.IMPACT to "임팩트",
+            GolfSwingPhase.FOLLOW_THROUGH to "팔로우",
+            GolfSwingPhase.FINISH to "피니시"
+        )
+
+        val indicatorHeight = 60f
+        val indicatorY = height - indicatorHeight - 40f  // 화면 하단에서 40px 위
+        val padding = 16f
+        val totalWidth = screenWidth - (padding * 2)
+        val itemWidth = totalWidth / phases.size
+        val cornerRadius = 12f
+
+        // 배경 박스
+        val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0x88000000.toInt()
+            style = Paint.Style.FILL
+        }
+        canvas.drawRoundRect(
+            padding, indicatorY - 10f,
+            screenWidth - padding, indicatorY + indicatorHeight + 10f,
+            cornerRadius, cornerRadius, bgPaint
+        )
+
+        phases.forEachIndexed { index, (phase, label) ->
+            val x = padding + (index * itemWidth)
+            val centerX = x + (itemWidth / 2)
+            val centerY = indicatorY + (indicatorHeight / 2)
+
+            // 현재 상태 확인
+            val isCurrentPhase = analysis?.phase == phase
+            val isCompletedPhase = analysis?.let { currentAnalysis ->
+                phases.indexOfFirst { it.first == currentAnalysis.phase } >= index
+            } ?: false
+
+            // 원 그리기 (신호등)
+            val circleRadius = 18f
+
+            swingIndicatorPaint.color = when {
+                isCurrentPhase -> {
+                    // 현재 상태: 밝은 녹색 + 깜빡임 효과
+                    val alpha = (((System.currentTimeMillis() / 300) % 2) * 127 + 128).toInt()
+                    (alpha shl 24) or 0x00FF00
+                }
+                isCompletedPhase -> 0xFF4CAF50.toInt()  // 완료된 상태: 연한 녹색
+                else -> 0xFF424242.toInt()  // 미도달 상태: 회색
+            }
+
+            canvas.drawCircle(centerX, centerY - 10f, circleRadius, swingIndicatorPaint)
+
+            // 테두리
+            if (isCurrentPhase) {
+                swingIndicatorStrokePaint.strokeWidth = 3f
+                canvas.drawCircle(centerX, centerY - 10f, circleRadius, swingIndicatorStrokePaint)
+            }
+
+            // 레이블
+            swingStatePaint.color = if (isCurrentPhase || isCompletedPhase) {
+                0xFFFFFFFF.toInt()
+            } else {
+                0xFF888888.toInt()
+            }
+            swingStatePaint.textSize = if (isCurrentPhase) 18f else 16f
+            swingStatePaint.isFakeBoldText = isCurrentPhase
+
+            canvas.drawText(label, centerX, centerY + 20f, swingStatePaint)
+
+            // 신뢰도 표시 (현재 상태일 때만)
+            if (isCurrentPhase && analysis != null) {
+                val confidenceText = "${(analysis.confidence * 100).toInt()}%"
+                swingStatePaint.textSize = 14f
+                swingStatePaint.color = 0xFFFFCC00.toInt()
+                canvas.drawText(confidenceText, centerX, centerY + 38f, swingStatePaint)
             }
         }
     }
