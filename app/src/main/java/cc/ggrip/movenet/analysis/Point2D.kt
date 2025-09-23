@@ -7,7 +7,4 @@ data class Point2D(val x: Float, val y: Float) {
         return kotlin.math.sqrt(dx * dx + dy * dy)
     }
 
-    fun midPoint(other: Point2D): Point2D {
-        return Point2D((x + other.x) / 2f, (y + other.y) / 2f)
-    }
 }

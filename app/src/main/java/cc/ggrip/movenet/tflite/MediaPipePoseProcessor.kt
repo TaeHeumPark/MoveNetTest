@@ -1,5 +1,5 @@
 ﻿// MediaPipePoseProcessor.kt
-package cc.ggrip.movenet.mediapipe
+package cc.ggrip.movenet.tflite
 
 import android.content.Context
 import android.graphics.Bitmap

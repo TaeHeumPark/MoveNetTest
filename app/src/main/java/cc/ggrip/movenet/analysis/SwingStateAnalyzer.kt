@@ -28,7 +28,6 @@ class SwingStateAnalyzer {
     private var previousFrame: PoseFrame? = null
     private var frameHistory = mutableListOf<PoseFrame>()
     private val historySize = 10
-    private val mediaPipeAnalyzer = MediaPipeSwingAnalyzer()
 
     // 조정 가능한 임계값들 (극단적으로 완화)
     private var addressSpeedThreshold = 0.01f  // 극단적 완화
@@ -78,8 +77,7 @@ class SwingStateAnalyzer {
         // 키포인트 수로 MoveNet(17개, 34 좌표) vs MediaPipe(33개, 66 좌표) 구분
         val analysis = when {
             frameHistory.size < 3 -> SwingPhaseAnalysis(GolfSwingPhase.ADDRESS, 0.5f, 0f, 0f, 0f)
-            frame.screen2d.size >= 66 -> mediaPipeAnalyzer.analyzeSwingState(frame)  // MediaPipe
-            else -> detectSwingState(frame)  // MoveNet
+            else -> detectSwingState(frame)  // 모든 모델에 대해 동일한 분석 사용
         }
 
         previousFrame = frame

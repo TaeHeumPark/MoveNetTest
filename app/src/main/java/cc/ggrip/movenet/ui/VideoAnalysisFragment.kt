@@ -19,7 +19,6 @@ import androidx.annotation.RequiresApi
 import androidx.fragment.app.Fragment
 import androidx.lifecycle.lifecycleScope
 import cc.ggrip.movenet.R
-import cc.ggrip.movenet.analysis.MoveNetVideoAnalyzer
 import cc.ggrip.movenet.bench.Engine
 import cc.ggrip.movenet.bench.ModelAssets
 import cc.ggrip.movenet.bench.Tier
@@ -82,13 +81,6 @@ class VideoAnalysisFragment : Fragment() {
     )
     private var selectedModelIndex = 1 // 기본: MoveNet thunder
 
-    // ====== 프리패스 파라미터 (리콜↑) ======
-    private val preFps = 8                    // 5 → 8 (더 촘촘)
-    private val preW = 160; private val preH = 90
-    private val diffThreshold = 0.05f         // 0.08 → 0.05 (민감도↑)
-    private val minWindowMs = 400L            // 500 → 400
-    private val padWindowMs = 800L            // 400 → 800 (전후 넉넉)
-    private val mergeGapMs = 1000L            // 600 → 1000 (근접 병합)
 
     // 추론 프레임률(리콜↑)
     private val TARGET_INFER_FPS = 20         // 15 → 20
@@ -113,6 +105,7 @@ class VideoAnalysisFragment : Fragment() {
         return inflater.inflate(R.layout.fragment_video_analysis, container, false)
     }
 
+    @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         // Bind UI
         playerView = view.findViewById(R.id.playerView)
@@ -367,7 +360,10 @@ class VideoAnalysisFragment : Fragment() {
         val preStepMs = 200L                 // ≈5fps만 본다(충분)
         val ySampleStep = 16                 // Y평면 16픽셀 간격 샘플
         val yDiffThr = 12                    // 밝기 차 임계(0~255)
-        val motionRatioThr = diffThreshold   // 기존 임계 재사용(0.05f 등)
+        val motionRatioThr = 0.05f   // 밝기 변화 임계값
+        val minWindowMs = 400L        // 최소 윈도우 크기
+        val padWindowMs = 800L        // 전후 패딩
+        val mergeGapMs = 1000L        // 병합 간격
 
         val info = readVideoInfo(requireContext(), uri)
         val durMs = info.durationMs
@@ -581,148 +577,6 @@ class VideoAnalysisFragment : Fragment() {
     }
 
 
-    private suspend fun coarseMotionWindows(
-        uri: Uri,
-        onProgress: suspend (processedMs: Long, totalMs: Long) -> Unit = { _, _ -> }
-    ): List<Pair<Long, Long>> {
-
-        val mmr = MediaMetadataRetriever()
-        mmr.setDataSource(requireContext(), uri)
-        val durMs = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
-        val stepMs = (1000 / preFps).toLong()
-        onProgress(0L, durMs)
-
-        val windows = mutableListOf<Pair<Long, Long>>()
-        var inMotion = false
-        var winStart = 0L
-        var lastMotionMs = -1L
-
-        var prevPixels: IntArray? = null
-        var prevW = -1
-        var prevH = -1
-
-        var t = 0L
-        try {
-            while (t <= durMs && isAdded && coroutineContext.isActive) {
-                val bmp: Bitmap? = withContext(Dispatchers.IO) {
-                    try {
-                        if (Build.VERSION.SDK_INT >= 27) {
-                            mmr.getScaledFrameAtTime(
-                                t * 1000L,
-                                MediaMetadataRetriever.OPTION_CLOSEST,
-                                preW, preH
-                            )
-                        } else {
-                            mmr.getFrameAtTime(t * 1000L, MediaMetadataRetriever.OPTION_CLOSEST)
-                                ?.let { Bitmap.createScaledBitmap(it, preW, preH, false) }
-                        }
-                    } catch (_: Exception) { null }
-                }
-
-                if (bmp != null) {
-                    val use = if (bmp.width != preW || bmp.height != preH) {
-                        try { Bitmap.createScaledBitmap(bmp, preW, preH, false) } catch (_: Throwable) { null }
-                    } else bmp
-
-                    if (use != null) {
-                        val w = use.width
-                        val h = use.height
-                        val curr = IntArray(w * h)
-                        try {
-                            use.getPixels(curr, 0, w, 0, 0, w, h)
-                        } catch (e: IllegalArgumentException) {
-                            Log.w("Prepass", "getPixels mismatch, skip: ${e.message}")
-                            if (use !== bmp) use.recycle()
-                            bmp.recycle()
-                            onProgress(t, durMs)
-                            t += stepMs
-                            continue
-                        }
-
-                        val ratio = if (prevPixels != null && prevW == w && prevH == h) {
-                            motionRatio(prevPixels!!, curr, w, h)
-                        } else 0f
-
-                        if (ratio > diffThreshold) {
-                            if (!inMotion) {
-                                inMotion = true
-                                winStart = (t - stepMs).coerceAtLeast(0L)
-                            }
-                            lastMotionMs = t
-                        } else {
-                            if (inMotion && lastMotionMs >= 0 && (t - lastMotionMs) >= (stepMs * 2)) {
-                                val rawStart = winStart
-                                val rawEnd = lastMotionMs
-                                if (rawEnd - rawStart >= minWindowMs) {
-                                    windows += ((rawStart - padWindowMs).coerceAtLeast(0L)) to
-                                            ((rawEnd + padWindowMs).coerceAtMost(durMs))
-                                }
-                                inMotion = false
-                                lastMotionMs = -1L
-                            }
-                        }
-
-                        prevPixels = curr
-                        prevW = w
-                        prevH = h
-
-                        if (use !== bmp) use.recycle()
-                    }
-                    bmp.recycle()
-                }
-
-                onProgress(t, durMs)
-                t += stepMs
-            }
-
-            if (inMotion) {
-                val rawStart = winStart
-                val rawEnd = (lastMotionMs.takeIf { it >= 0 } ?: durMs)
-                if (rawEnd - rawStart >= minWindowMs) {
-                    windows += ((rawStart - padWindowMs).coerceAtLeast(0L)) to
-                            ((rawEnd + padWindowMs).coerceAtMost(durMs))
-                }
-            }
-        } finally {
-            mmr.release()
-        }
-
-        if (windows.size <= 1) return windows
-        val merged = mutableListOf<Pair<Long, Long>>()
-        var (cs, ce) = windows.first()
-        for (i in 1 until windows.size) {
-            val (ns, ne) = windows[i]
-            if (ns - ce <= mergeGapMs) ce = max(ce, ne) else { merged += cs to ce; cs = ns; ce = ne }
-        }
-        merged += cs to ce
-        return merged
-    }
-
-    /** 간단한 밝기 diff 비율(저샘플링) */
-    private fun motionRatio(prev: IntArray, curr: IntArray, w: Int, h: Int): Float {
-        var changed = 0
-        var total = 0
-        val step = 4
-        var y = 0
-        while (y < h) {
-            var x = 0
-            val row = y * w
-            while (x < w) {
-                val i = row + x
-                val p = prev[i]; val c = curr[i]
-                val pr = (p shr 16) and 0xFF; val pg = (p shr 8) and 0xFF; val pb = p and 0xFF
-                val cr = (c shr 16) and 0xFF; val cg = (c shr 8) and 0xFF; val cb = c and 0xFF
-                val py = (30*pr + 59*pg + 11*pb)
-                val cy = (30*cr + 59*cg + 11*cb)
-                val diff = kotlin.math.abs(py - cy)
-                if (diff > 22 * 100) changed++
-                total++
-                x += step
-            }
-            y += step
-        }
-        return if (total == 0) 0f else changed.toFloat() / total
-    }
 
     // -----------------------------
     // 2) 본 분석: 선택한 Detector로 포즈 추정 → 스윙 조건 감지

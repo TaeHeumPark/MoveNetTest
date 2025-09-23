@@ -21,7 +21,7 @@ import androidx.fragment.app.Fragment
 import cc.ggrip.movenet.R
 import cc.ggrip.movenet.bench.ModelAssets
 import cc.ggrip.movenet.bench.Tier
-import cc.ggrip.movenet.mediapipe.MediaPipePoseProcessor
+import cc.ggrip.movenet.tflite.MediaPipePoseProcessor
 import cc.ggrip.movenet.util.FpsGovernor
 import cc.ggrip.movenet.util.LatencyMeter
 import cc.ggrip.movenet.analysis.SwingStateAnalyzer
