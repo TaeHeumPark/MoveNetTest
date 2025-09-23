@@ -11,4 +11,51 @@
 
     <!-- DotsOverlay는 프래그먼트에서 코드로 addView -->
 
+    <!-- 스무딩 모드 선택 버튼 그룹 -->
+    <LinearLayout
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|end"
+        android:layout_margin="16dp"
+        android:orientation="vertical"
+        android:background="#80000000"
+        android:padding="8dp">
+
+        <RadioGroup
+            android:id="@+id/smoothingModeGroup"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <RadioButton
+                android:id="@+id/modeRaw"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="RAW"
+                android:textColor="#FFFFFF"
+                android:buttonTint="#FFFFFF"
+                android:checked="true" />
+
+            <RadioButton
+                android:id="@+id/modeEMA"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="EMA"
+                android:textColor="#FFFFFF"
+                android:buttonTint="#FFFFFF"
+                android:layout_marginStart="8dp" />
+
+            <RadioButton
+                android:id="@+id/modeFLK"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="FLK"
+                android:textColor="#FFFFFF"
+                android:buttonTint="#FFFFFF"
+                android:layout_marginStart="8dp" />
+
+        </RadioGroup>
+
+    </LinearLayout>
+
 </FrameLayout>
