@@ -10,6 +10,8 @@ import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
 import kotlin.math.max
 import kotlin.math.sqrt
+import kotlinx.coroutines.*
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * FLK TFLite 러너 (레포 GRU.h5 → TFLite 변환본과 호환)
@@ -30,9 +32,9 @@ class FLKProcessor(context: Context) {
         private const val TAG = "FLKProcessor"
 
         // 앱 자산 경로: app/src/main/assets/flk_gru_from_repo.tflite
-        private const val MODEL_PATH = "flk_gru.tflite"
+        private const val MODEL_PATH = "flk_gru_from_repo.tflite"
 
-        private const val WINDOW_SIZE = 64          // 변환 로그: T=64
+        private const val WINDOW_SIZE = 64          // 변환 로그: T=64 (모델이 요구하는 크기)
         private const val NUM_JOINTS = 12           // 변환 로그: D=36 → J=12
         private const val DIMS_PER_JOINT = 3
         private const val INPUT_DIM = NUM_JOINTS * DIMS_PER_JOINT // 36
@@ -45,12 +47,29 @@ class FLKProcessor(context: Context) {
     private var interpreter: Interpreter? = null
     private val ring: ArrayDeque<FloatArray> = ArrayDeque(WINDOW_SIZE)
 
+    // 성능 최적화: 버퍼 재사용
+    private val windowBuffer = FloatArray(WINDOW_SIZE * INPUT_DIM)
+    private val inputBuffer = ByteBuffer.allocateDirect(4 * WINDOW_SIZE * INPUT_DIM).order(ByteOrder.nativeOrder())
+    private val outputBuffer = ByteBuffer.allocateDirect(4 * INPUT_DIM).order(ByteOrder.nativeOrder())
+    private val outputArray = FloatArray(INPUT_DIM)
+
+    // 프레임 스킵
+    private var frameCounter = 0
+    private val FRAME_SKIP = 8 // 8프레임마다 1번만 처리 (더 공격적인 스킵)
+
+    // 비동기 처리
+    private val inferenceScope = CoroutineScope(Dispatchers.Default)
+    private val isInferenceRunning = AtomicBoolean(false)
+    private var lastInferenceResult: FloatArray? = null
+
     init {
         try {
             val modelBuffer = loadModelFile(context)
             val options = Interpreter.Options().apply {
                 // FLK GRU 모델은 Select TF Ops가 필요할 수 있음
-                setNumThreads(2)
+                setNumThreads(2) // 스레드를 줄여서 메인 스레드에 리소스 할당
+                // NNAPI는 Select TF Ops와 호환되지 않을 수 있으므로 비활성화
+                // setUseNNAPI(true)
                 // Select TF Ops는 dependency만 추가하면 자동으로 활성화됨
             }
             interpreter = Interpreter(modelBuffer, options)
@@ -64,6 +83,8 @@ class FLKProcessor(context: Context) {
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to load FLK model from: $MODEL_PATH", e)
+            Log.e(TAG, "Error details: ${e.message}")
+            e.printStackTrace()
             interpreter = null
         }
     }
@@ -103,7 +124,18 @@ class FLKProcessor(context: Context) {
             return null
         }
 
-        Log.d(TAG, "FLK processing with window size: ${ring.size}")
+        // 프레임 스킵으로 성능 개선
+        frameCounter++
+
+        // 이미 추론 중이면 마지막 결과 반환
+        if (isInferenceRunning.get()) {
+            return lastInferenceResult ?: ring.last()
+        }
+
+        // 프레임 스킵 체크
+        if (frameCounter % FRAME_SKIP != 0) {
+            return lastInferenceResult ?: ring.last()
+        }
 
         // 1) 힙센터(첫 프레임) 계산
         val first = ring.first()
@@ -111,53 +143,74 @@ class FLKProcessor(context: Context) {
         val hipY = 0.5f * (first[RHIP_BASE + 1] + first[LHIP_BASE + 1])
         val hipZ = 0.5f * (first[RHIP_BASE + 2] + first[LHIP_BASE + 2])
 
-        // 2) 윈도우 전체에서 힙센터 제거
-        val window = FloatArray(WINDOW_SIZE * INPUT_DIM)
-        var w = 0
-        for (t in 0 until WINDOW_SIZE) {
-            val f = ring.elementAt(t)
-            var j = 0
-            while (j < INPUT_DIM) {
-                window[w++] = f[j]     - hipX
-                window[w++] = f[j + 1] - hipY
-                window[w++] = f[j + 2] - hipZ
-                j += 3
+        // 비동기로 추론 실행
+        runInferenceAsync(ring.toList(), hipX, hipY, hipZ)
+
+        // 비동기 처리 중 마지막 결과 반환
+        return lastInferenceResult ?: ring.last()
+
+    }
+
+    private fun runInferenceAsync(windowFrames: List<FloatArray>, hipX: Float, hipY: Float, hipZ: Float) {
+        if (!isInferenceRunning.compareAndSet(false, true)) return
+
+        inferenceScope.launch {
+            try {
+                val startTime = System.currentTimeMillis()
+                val itp = interpreter ?: return@launch
+
+                // 2) 윈도우 전체에서 힙센터 제거
+                var w = 0
+                for (t in 0 until WINDOW_SIZE) {
+                    val f = windowFrames[t]
+                    var j = 0
+                    while (j < INPUT_DIM) {
+                        windowBuffer[w++] = f[j]     - hipX
+                        windowBuffer[w++] = f[j + 1] - hipY
+                        windowBuffer[w++] = f[j + 2] - hipZ
+                        j += 3
+                    }
+                }
+
+                // 3) μ/σ(스칼라) 표준화
+                val mu = mean(windowBuffer)
+                val sd = std(windowBuffer, mu).let { if (it < 1e-6f) 1f else it }
+                for (i in windowBuffer.indices) windowBuffer[i] = (windowBuffer[i] - mu) / sd
+
+                // 4) TFLite 입력 [1, T, D]
+                inputBuffer.rewind()
+                for (v in windowBuffer) inputBuffer.putFloat(v)
+                inputBuffer.rewind()
+
+                // 5) 출력 [1, D]
+                outputBuffer.rewind()
+                itp.run(inputBuffer, outputBuffer)
+
+                // 6) 복원
+                outputBuffer.rewind()
+                val result = FloatArray(INPUT_DIM)
+                for (i in 0 until INPUT_DIM) result[i] = outputBuffer.getFloat()
+
+                var k = 0
+                while (k < INPUT_DIM) {
+                    result[k]     = result[k]     * sd + mu + hipX
+                    result[k + 1] = result[k + 1] * sd + mu + hipY
+                    result[k + 2] = result[k + 2] * sd + mu + hipZ
+                    k += 3
+                }
+
+                lastInferenceResult = result
+
+                val elapsedTime = System.currentTimeMillis() - startTime
+                if (elapsedTime > 50) {
+                    Log.w(TAG, "FLK async inference took ${elapsedTime}ms")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Async inference failed", e)
+            } finally {
+                isInferenceRunning.set(false)
             }
         }
-
-        // 3) μ/σ(스칼라) 표준화 (윈도우 전체 평탄화 기준)
-        val mu = mean(window)
-        val sd = std(window, mu).let { if (it < 1e-6f) 1f else it }
-        for (i in window.indices) window[i] = (window[i] - mu) / sd
-
-        // 4) TFLite 입력 [1, T, D]
-        val inBuf = ByteBuffer.allocateDirect(4 * WINDOW_SIZE * INPUT_DIM).order(ByteOrder.nativeOrder())
-        for (v in window) inBuf.putFloat(v)
-        inBuf.rewind()
-
-        // 5) 출력 [1, D]
-        val outBuf = ByteBuffer.allocateDirect(4 * INPUT_DIM).order(ByteOrder.nativeOrder())
-        outBuf.rewind()
-        try {
-            itp.run(inBuf, outBuf)
-        } catch (e: Exception) {
-            Log.e(TAG, "Inference failed", e)
-            return ring.last() // 실패 시 최근 프레임 그대로 (힙센터 붙인 원본)
-        }
-
-        // 6) 복원: y*σ + μ 후 힙센터 되돌리기
-        outBuf.rewind()
-        val y = FloatArray(INPUT_DIM)
-        for (i in 0 until INPUT_DIM) y[i] = outBuf.getFloat()
-
-        var k = 0
-        while (k < INPUT_DIM) {
-            y[k]     = y[k]     * sd + mu + hipX
-            y[k + 1] = y[k + 1] * sd + mu + hipY
-            y[k + 2] = y[k + 2] * sd + mu + hipZ
-            k += 3
-        }
-        return y
     }
 
     private fun mean(arr: FloatArray): Float {
@@ -178,9 +231,13 @@ class FLKProcessor(context: Context) {
     fun reset() {
         Log.d(TAG, "FLK reset called, clearing ${ring.size} frames")
         ring.clear()
+        frameCounter = 0
+        lastInferenceResult = null
+        isInferenceRunning.set(false)
     }
 
     fun close() {
+        inferenceScope.cancel()
         try { interpreter?.close() } catch (_: Throwable) {}
         interpreter = null
     }
