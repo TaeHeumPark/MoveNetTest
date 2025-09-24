@@ -29,7 +29,7 @@ class FLKProcessor(context: Context) {
     companion object {
         private const val TAG = "FLKProcessor"
 
-        // 앱 자산 경로: app/src/main/assets/flk_gru.tflite
+        // 앱 자산 경로: app/src/main/assets/flk_gru_from_repo.tflite
         private const val MODEL_PATH = "flk_gru.tflite"
 
         private const val WINDOW_SIZE = 64          // 변환 로그: T=64
@@ -49,11 +49,12 @@ class FLKProcessor(context: Context) {
         try {
             val modelBuffer = loadModelFile(context)
             val options = Interpreter.Options().apply {
-                // Select TF Ops 사용 시 보통 별도 delegate 추가 없이 동작
-                // setNumThreads(2) // 필요 시
+                // FLK GRU 모델은 Select TF Ops가 필요할 수 있음
+                setNumThreads(2)
+                // Select TF Ops는 dependency만 추가하면 자동으로 활성화됨
             }
             interpreter = Interpreter(modelBuffer, options)
-            Log.d(TAG, "FLK model loaded")
+            Log.d(TAG, "FLK model loaded successfully from: $MODEL_PATH")
 
             interpreter?.let {
                 val inShape = it.getInputTensor(0).shape()
@@ -62,12 +63,15 @@ class FLKProcessor(context: Context) {
                 Log.d(TAG, "Output shape: ${outShape.contentToString()} (expect [1,$INPUT_DIM])")
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to load FLK model", e)
+            Log.e(TAG, "Failed to load FLK model from: $MODEL_PATH", e)
+            interpreter = null
         }
     }
 
     private fun loadModelFile(context: Context): MappedByteBuffer {
+        Log.d(TAG, "Attempting to load model from: $MODEL_PATH")
         val afd = context.assets.openFd(MODEL_PATH)
+        Log.d(TAG, "AssetFileDescriptor obtained, offset: ${afd.startOffset}, length: ${afd.declaredLength}")
         FileInputStream(afd.fileDescriptor).use { fis ->
             return fis.channel.map(FileChannel.MapMode.READ_ONLY, afd.startOffset, afd.declaredLength)
         }
@@ -79,17 +83,27 @@ class FLKProcessor(context: Context) {
      * @return 스무딩된 12×3 (길이 36). 아직 윈도우 미만이면 null
      */
     fun processFrame(world12x3: FloatArray, visibility12: FloatArray? = null): FloatArray? {
-        val itp = interpreter ?: return null
-        require(world12x3.size == INPUT_DIM) { "FLKProcessor expects D=$INPUT_DIM (12 joints × 3D)" }
+        if (interpreter == null) {
+            Log.e(TAG, "FLK interpreter is null, model not loaded")
+            return null
+        }
+        val itp = interpreter!!
+
+        if (world12x3.size != INPUT_DIM) {
+            Log.e(TAG, "Invalid input size: ${world12x3.size}, expected $INPUT_DIM")
+            return null
+        }
 
         if (ring.size == WINDOW_SIZE) ring.removeFirst()
         ring.addLast(world12x3.copyOf())
 
         if (ring.size < WINDOW_SIZE) {
             // 윈도우가 찰 때까지는 호출측에서 RAW/EMA를 쓰도록 null 반환
-            Log.d(TAG, "Warmup ${ring.size}/$WINDOW_SIZE")
+            Log.d(TAG, "FLK Warmup ${ring.size}/$WINDOW_SIZE")
             return null
         }
+
+        Log.d(TAG, "FLK processing with window size: ${ring.size}")
 
         // 1) 힙센터(첫 프레임) 계산
         val first = ring.first()
@@ -162,6 +176,7 @@ class FLKProcessor(context: Context) {
     }
 
     fun reset() {
+        Log.d(TAG, "FLK reset called, clearing ${ring.size} frames")
         ring.clear()
     }
 

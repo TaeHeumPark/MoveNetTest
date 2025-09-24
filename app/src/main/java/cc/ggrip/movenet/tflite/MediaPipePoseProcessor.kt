@@ -81,9 +81,12 @@ class MediaPipePoseProcessor(
     private val flkProcessor = FLKProcessor(context)
     var smoothingMode: SmoothingMode = SmoothingMode.RAW
         set(value) {
-            field = value
-            // 모드 변경 시 내부 상태 초기화
-            resetSmoothing()
+            if (field != value) {
+                Log.d(TAG_MP, "Smoothing mode changed from $field to $value")
+                field = value
+                // 모드 변경 시 내부 상태 초기화
+                resetSmoothing()
+            }
         }
 
     // 디바이스/백프레셔 & 타임스탬프
@@ -188,13 +191,17 @@ class MediaPipePoseProcessor(
                                 ema33
                             }
                             SmoothingMode.FLK -> {
-                                Log.d(TAG_MP, "Mode: FLK")
+                                Log.d(TAG_MP, "Mode: FLK - Processing frame")
                                 // 33→12 추출
                                 val in12 = pickJoints3D(world3d, MP_33_TO_FLK12)
                                 val vis12 = pickVisibility(visibility, MP_33_TO_FLK12)
+                                Log.d(TAG_MP, "FLK input12 size: ${in12.size}, vis12 size: ${vis12.size}")
+
                                 val out12 = flkProcessor.processFrame(in12, vis12)
                                 val applied = ema33.copyOf() // FLK 없으면 EMA로 폴백
+
                                 if (out12 != null && out12.size == in12.size) {
+                                    Log.d(TAG_MP, "FLK output received, size: ${out12.size}")
                                     mergeBack3D(applied, out12, MP_33_TO_FLK12)
                                     val lW = 15 * 3; val rW = 16 * 3
                                     Log.d(TAG_MP, "Wrist RAW L(${world3d[lW]}, ${world3d[lW+1]}, ${world3d[lW+2]}), " +
@@ -202,7 +209,7 @@ class MediaPipePoseProcessor(
                                     Log.d(TAG_MP, "Wrist FLK L(${applied[lW]}, ${applied[lW+1]}, ${applied[lW+2]}), " +
                                             "R(${applied[rW]}, ${applied[rW+1]}, ${applied[rW+2]})")
                                 } else {
-                                    Log.d(TAG_MP, "FLK warmup → EMA fallback")
+                                    Log.d(TAG_MP, "FLK warmup → EMA fallback (out12: ${out12?.size ?: "null"})")
                                 }
                                 applied
                             }
