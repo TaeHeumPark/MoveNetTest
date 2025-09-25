@@ -85,7 +85,7 @@ class RealtimeDotsFragment : Fragment() {
         ).also {
             (view as ViewGroup).addView(it, ViewGroup.LayoutParams(MATCH_PARENT, MATCH_PARENT))
             it.bringToFront()
-            it.setMirrorFlip(mirrorX = true, flipY = false) // 전면 카메라 기준
+            it.setMirrorFlip(mirrorX = true, flipY = false) // 미러링 비활성화로 좌우 반전 문제 해결
             it.setEngineLabel("MoveNet")
             it.setModelLabel(
                 when (chosenTier) {

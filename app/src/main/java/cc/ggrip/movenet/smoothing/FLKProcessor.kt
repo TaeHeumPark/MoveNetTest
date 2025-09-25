@@ -12,6 +12,9 @@ import kotlin.math.max
 import kotlin.math.sqrt
 import kotlinx.coroutines.*
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.Executors
+import android.os.Process
+import kotlin.math.abs
 
 /**
  * FLK TFLite 러너 (레포 GRU.h5 → TFLite 변환본과 호환)
@@ -53,33 +56,59 @@ class FLKProcessor(context: Context) {
     private val outputBuffer = ByteBuffer.allocateDirect(4 * INPUT_DIM).order(ByteOrder.nativeOrder())
     private val outputArray = FloatArray(INPUT_DIM)
 
-    // 프레임 스킵
+    // 프레임 스킵 및 보간
     private var frameCounter = 0
-    private val FRAME_SKIP = 8 // 8프레임마다 1번만 처리 (더 공격적인 스킵)
-
-    // 비동기 처리
-    private val inferenceScope = CoroutineScope(Dispatchers.Default)
-    private val isInferenceRunning = AtomicBoolean(false)
+    private val FRAME_SKIP = 3 // 3프레임마다 1번만 처리 (30fps -> 10Hz)
     private var lastInferenceResult: FloatArray? = null
+    private var previousInferenceResult: FloatArray? = null
+    private var lerpAlpha = 0f
+
+    // 속도 기반 게이팅
+    private var previousFrameTime = 0L
+    private var previousPositions: FloatArray? = null
+    private val VELOCITY_THRESHOLD = 0.05f // 속도 임계치
+    private val SWING_ZONE_MIN_SPEED = 0.1f // 스윙 구간 최소 속도
+    private var isInSwingZone = false
+
+    // 고성능 백그라운드 스레드
+    private val executorService = Executors.newSingleThreadExecutor { r ->
+        Thread(r).apply {
+            name = "FLK-Inference-Thread"
+            priority = Thread.MAX_PRIORITY - 1 // 높은 우선순위
+        }
+    }
+    private val inferenceScope = CoroutineScope(executorService.asCoroutineDispatcher())
+    private val isInferenceRunning = AtomicBoolean(false)
 
     init {
+        Log.d(TAG, "Starting FLK model initialization...")
         try {
+            Log.d(TAG, "Loading model file from assets: $MODEL_PATH")
             val modelBuffer = loadModelFile(context)
-            val options = Interpreter.Options().apply {
-                // FLK GRU 모델은 Select TF Ops가 필요할 수 있음
-                setNumThreads(2) // 스레드를 줄여서 메인 스레드에 리소스 할당
-                // NNAPI는 Select TF Ops와 호환되지 않을 수 있으므로 비활성화
-                // setUseNNAPI(true)
-                // Select TF Ops는 dependency만 추가하면 자동으로 활성화됨
-            }
-            interpreter = Interpreter(modelBuffer, options)
-            Log.d(TAG, "FLK model loaded successfully from: $MODEL_PATH")
+            Log.d(TAG, "Model file loaded successfully, size: ${modelBuffer.capacity()} bytes")
 
-            interpreter?.let {
-                val inShape = it.getInputTensor(0).shape()
-                val outShape = it.getOutputTensor(0).shape()
-                Log.d(TAG, "Input shape: ${inShape.contentToString()}  (expect [1,$WINDOW_SIZE,$INPUT_DIM])")
-                Log.d(TAG, "Output shape: ${outShape.contentToString()} (expect [1,$INPUT_DIM])")
+            val options = Interpreter.Options()
+
+            // GRU 모델은 Select TF Ops가 필요하므로 GPU는 사용하지 않음
+            // GPU Delegate와 Select TF Ops는 호환되지 않을 수 있음
+            Log.d(TAG, "Configuring CPU-only execution for GRU model with Select TF Ops")
+            options.setNumThreads(4) // CPU 최적화: 4 스레드 사용
+            options.setUseXNNPACK(true) // XNNPACK 가속 사용 (CPU 최적화)
+
+            Log.d(TAG, "Creating TFLite interpreter with CPU optimization...")
+            interpreter = Interpreter(modelBuffer, options)
+
+            if (interpreter == null) {
+                Log.e(TAG, "Interpreter creation returned null!")
+            } else {
+                Log.d(TAG, "FLK model loaded successfully from: $MODEL_PATH (CPU with XNNPACK)")
+
+                interpreter?.let {
+                    val inShape = it.getInputTensor(0).shape()
+                    val outShape = it.getOutputTensor(0).shape()
+                    Log.d(TAG, "Input shape: ${inShape.contentToString()}  (expect [1,$WINDOW_SIZE,$INPUT_DIM])")
+                    Log.d(TAG, "Output shape: ${outShape.contentToString()} (expect [1,$INPUT_DIM])")
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to load FLK model from: $MODEL_PATH", e)
@@ -104,6 +133,25 @@ class FLKProcessor(context: Context) {
      * @return 스무딩된 12×3 (길이 36). 아직 윈도우 미만이면 null
      */
     fun processFrame(world12x3: FloatArray, visibility12: FloatArray? = null): FloatArray? {
+        // 속도 계산 및 게이팅
+        val currentTime = System.currentTimeMillis()
+        if (previousPositions != null && previousFrameTime > 0) {
+            val dt = (currentTime - previousFrameTime) / 1000f // 초 단위
+            val velocity = calculateVelocity(previousPositions!!, world12x3, dt)
+
+            // 스윙 구간 판단 (속도가 높을 때만 FLK 활성화)
+            isInSwingZone = velocity > SWING_ZONE_MIN_SPEED
+
+            if (!isInSwingZone) {
+                // 정지/슬로우 구간에서는 FLK 사용 안 함
+                previousPositions = world12x3.copyOf()
+                previousFrameTime = currentTime
+                return world12x3 // 원본 데이터 그대로 반환
+            }
+        }
+        previousPositions = world12x3.copyOf()
+        previousFrameTime = currentTime
+
         if (interpreter == null) {
             Log.e(TAG, "FLK interpreter is null, model not loaded")
             return null
@@ -124,18 +172,22 @@ class FLKProcessor(context: Context) {
             return null
         }
 
-        // 프레임 스킵으로 성능 개선
+        // 프레임 스킵 및 보간 처리
         frameCounter++
 
-        // 이미 추론 중이면 마지막 결과 반환
+        // 이미 추론 중이면 보간된 결과 반환
         if (isInferenceRunning.get()) {
-            return lastInferenceResult ?: ring.last()
+            return interpolateResults()
         }
 
-        // 프레임 스킵 체크
+        // 프레임 스킵 체크 - 스킵 시 보간 사용
         if (frameCounter % FRAME_SKIP != 0) {
-            return lastInferenceResult ?: ring.last()
+            lerpAlpha = (frameCounter % FRAME_SKIP).toFloat() / FRAME_SKIP
+            return interpolateResults()
         }
+
+        // 새로운 추론 시작
+        lerpAlpha = 0f
 
         // 1) 힙센터(첫 프레임) 계산
         val first = ring.first()
@@ -156,6 +208,9 @@ class FLKProcessor(context: Context) {
 
         inferenceScope.launch {
             try {
+                // 스레드 우선순위 설정
+                Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+
                 val startTime = System.currentTimeMillis()
                 val itp = interpreter ?: return@launch
 
@@ -199,11 +254,16 @@ class FLKProcessor(context: Context) {
                     k += 3
                 }
 
+                // 이전 결과 저장 후 새 결과로 업데이트
+                previousInferenceResult = lastInferenceResult
                 lastInferenceResult = result
+                lerpAlpha = 0f // 새 추론 완료 시 보간 지수 리셋
 
                 val elapsedTime = System.currentTimeMillis() - startTime
                 if (elapsedTime > 50) {
-                    Log.w(TAG, "FLK async inference took ${elapsedTime}ms")
+                    Log.w(TAG, "FLK CPU inference took ${elapsedTime}ms")
+                } else {
+                    Log.d(TAG, "FLK CPU inference completed in ${elapsedTime}ms")
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Async inference failed", e)
@@ -211,6 +271,102 @@ class FLKProcessor(context: Context) {
                 isInferenceRunning.set(false)
             }
         }
+    }
+
+    // 보간 함수 (Linear Interpolation)
+    private fun interpolateResults(): FloatArray? {
+        val current = lastInferenceResult ?: return ring.last()
+        val previous = previousInferenceResult ?: return current
+
+        // lerp: result = previous * (1 - alpha) + current * alpha
+        val interpolated = FloatArray(INPUT_DIM)
+        for (i in 0 until INPUT_DIM) {
+            interpolated[i] = previous[i] * (1f - lerpAlpha) + current[i] * lerpAlpha
+        }
+
+        // 스무딩 품질 메트릭 계산 (주요 관절만)
+        if (ring.size >= 2) {
+            val raw = ring.last()
+            calculateSmoothingMetrics(raw, interpolated)
+        }
+
+        return interpolated
+    }
+
+    // 스무딩 품질 메트릭 계산
+    private fun calculateSmoothingMetrics(raw: FloatArray, smoothed: FloatArray) {
+        // 손목 관절 (가장 움직임이 큰 부위)
+        val leftWristIdx = 8 * 3  // LWrist
+        val rightWristIdx = 11 * 3 // RWrist
+
+        // 지터(떨림) 계산 - 연속 프레임 간 차이
+        var rawJitter = 0f
+        var smoothedJitter = 0f
+
+        if (previousPositions != null) {
+            // 왼손목 지터
+            for (i in 0..2) {
+                val rawDiff = abs(raw[leftWristIdx + i] - previousPositions!![leftWristIdx + i])
+                val smoothDiff = abs(smoothed[leftWristIdx + i] -
+                    (lastInferenceResult?.get(leftWristIdx + i) ?: smoothed[leftWristIdx + i]))
+                rawJitter += rawDiff
+                smoothedJitter += smoothDiff
+            }
+
+            // 오른손목 지터
+            for (i in 0..2) {
+                val rawDiff = abs(raw[rightWristIdx + i] - previousPositions!![rightWristIdx + i])
+                val smoothDiff = abs(smoothed[rightWristIdx + i] -
+                    (lastInferenceResult?.get(rightWristIdx + i) ?: smoothed[rightWristIdx + i]))
+                rawJitter += rawDiff
+                smoothedJitter += smoothDiff
+            }
+
+            // 지터 감소율 계산
+            val jitterReduction = if (rawJitter > 0) {
+                ((rawJitter - smoothedJitter) / rawJitter) * 100f
+            } else 0f
+
+            // 스무딩 강도 (원본과의 차이)
+            var smoothingStrength = 0f
+            for (i in 0..2) {
+                smoothingStrength += abs(smoothed[leftWristIdx + i] - raw[leftWristIdx + i])
+                smoothingStrength += abs(smoothed[rightWristIdx + i] - raw[rightWristIdx + i])
+            }
+
+            // 10프레임마다 메트릭 출력
+            if (frameCounter % 10 == 0) {
+                Log.d(TAG, "=== FLK Smoothing Metrics ===")
+                Log.d(TAG, "Raw Jitter: %.4f, Smoothed Jitter: %.4f".format(rawJitter, smoothedJitter))
+                Log.d(TAG, "Jitter Reduction: %.1f%%".format(jitterReduction))
+                Log.d(TAG, "Smoothing Strength: %.4f".format(smoothingStrength))
+                Log.d(TAG, "===========================")
+            }
+        }
+    }
+
+    // 속도 계산 (RMS of joint velocities)
+    private fun calculateVelocity(prev: FloatArray, curr: FloatArray, dt: Float): Float {
+        if (dt <= 0) return 0f
+
+        var sumSquared = 0f
+        var count = 0
+
+        // 주요 관절(손목, 팔꿈치)의 속도만 계산
+        val keyJoints = intArrayOf(8, 10, 11) // LWrist, RElbow, RWrist 인덱스
+        for (jointIdx in keyJoints) {
+            val base = jointIdx * 3
+            val dx = curr[base] - prev[base]
+            val dy = curr[base + 1] - prev[base + 1]
+            val dz = curr[base + 2] - prev[base + 2]
+            val distSquared = dx * dx + dy * dy + dz * dz
+            sumSquared += distSquared
+            count++
+        }
+
+        return if (count > 0) {
+            sqrt(sumSquared / count) / dt
+        } else 0f
     }
 
     private fun mean(arr: FloatArray): Float {
@@ -233,12 +389,20 @@ class FLKProcessor(context: Context) {
         ring.clear()
         frameCounter = 0
         lastInferenceResult = null
+        previousInferenceResult = null
+        previousPositions = null
+        previousFrameTime = 0L
+        isInSwingZone = false
+        lerpAlpha = 0f
         isInferenceRunning.set(false)
     }
 
     fun close() {
         inferenceScope.cancel()
-        try { interpreter?.close() } catch (_: Throwable) {}
+        executorService.shutdown()
+        try {
+            interpreter?.close()
+        } catch (_: Throwable) {}
         interpreter = null
     }
 }

@@ -82,7 +82,7 @@ class MediaPipeRealtimeFragment : Fragment() {
         ).also {
             (view as ViewGroup).addView(it, ViewGroup.LayoutParams(MATCH_PARENT, MATCH_PARENT))
             it.bringToFront()
-            it.setMirrorFlip(mirrorX = true, flipY = false)
+            it.setMirrorFlip(mirrorX = true, flipY = false) // 미러링 비활성화로 좌우 반전 문제 해결
             it.setEngineLabel("MediaPipe")
             it.setModelLabel(
                 when (chosenTier) {
