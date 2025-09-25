@@ -54,7 +54,6 @@ dependencies {
     implementation("androidx.camera:camera-view:1.5.0")
     // TensorFlow Lite
     implementation("org.tensorflow:tensorflow-lite:2.17.0")
-    implementation("org.tensorflow:tensorflow-lite-select-tf-ops:2.16.1") // FLK GRU 모델에 필요
     implementation("org.tensorflow:tensorflow-lite-gpu-api:2.17.0")
 
     // GPU: 플러그인 경로(둘 다 필요)

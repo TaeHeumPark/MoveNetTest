@@ -7,9 +7,13 @@ import android.os.Bundle
 import android.util.Rational
 import android.view.*
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
-import android.widget.RadioGroup
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.camera.core.*
+import androidx.camera.core.AspectRatio
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.Preview
+import androidx.camera.core.UseCaseGroup
+import androidx.camera.core.ViewPort
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
@@ -17,11 +21,11 @@ import androidx.fragment.app.Fragment
 import cc.ggrip.movenet.R
 import cc.ggrip.movenet.bench.ModelAssets
 import cc.ggrip.movenet.bench.Tier
-import cc.ggrip.movenet.smoothing.SmoothingMode
 import cc.ggrip.movenet.tflite.MediaPipePoseProcessor
 import cc.ggrip.movenet.util.FpsGovernor
 import cc.ggrip.movenet.util.LatencyMeter
 import cc.ggrip.movenet.analysis.SwingStateAnalyzer
+import cc.ggrip.movenet.analysis.SwingPhaseAnalysis
 import java.util.concurrent.Executors
 
 class MediaPipeRealtimeFragment : Fragment() {
@@ -44,7 +48,6 @@ class MediaPipeRealtimeFragment : Fragment() {
     private lateinit var fpsGov: FpsGovernor
     private lateinit var latencyMeter: LatencyMeter
     private lateinit var swingAnalyzer: SwingStateAnalyzer
-    private var smoothingModeGroup: RadioGroup? = null
     private var targetFps = 30.0
     private var chosenTier: Tier = Tier.LIGHT
 
@@ -82,7 +85,7 @@ class MediaPipeRealtimeFragment : Fragment() {
         ).also {
             (view as ViewGroup).addView(it, ViewGroup.LayoutParams(MATCH_PARENT, MATCH_PARENT))
             it.bringToFront()
-            it.setMirrorFlip(mirrorX = true, flipY = false) // 미러링 비활성화로 좌우 반전 문제 해결
+            it.setMirrorFlip(mirrorX = true, flipY = false)
             it.setEngineLabel("MediaPipe")
             it.setModelLabel(
                 when (chosenTier) {
@@ -93,50 +96,19 @@ class MediaPipeRealtimeFragment : Fragment() {
             )
         }
 
-        // Processor 생성
         val assetPath = ModelAssets.mpTaskPath(chosenTier)
         processor = MediaPipePoseProcessor(requireContext(), assetPath) { frame ->
-
-            overlay.setAcceleratorLabel(processor.currentDelegate())
-
             frame?.let {
+                // 스윙 상태 분석
                 val swingAnalysis = swingAnalyzer.analyzeSwingState(it)
+
                 overlay.post {
                     overlay.update(it)
                     overlay.updateSwingState(swingAnalysis)
                 }
             }
         }
-
-        // 가속기 라벨 & 초기 엔진 라벨 동기화
         overlay.setAcceleratorLabel(processor.currentDelegate())
-        overlay.setEngineLabel(
-            when (SmoothingMode.RAW) {
-                SmoothingMode.RAW -> "MediaPipe (Raw)"
-                SmoothingMode.EMA -> "MediaPipe (EMA)"
-                SmoothingMode.FLK -> "MediaPipe (FLK)"
-            }
-        )
-
-        // 스무딩 모드 라디오 리스너 (overlay 생성 이후 등록)
-        smoothingModeGroup = view.findViewById(R.id.smoothingModeGroup)
-        smoothingModeGroup?.setOnCheckedChangeListener { _, checkedId ->
-            val mode = when (checkedId) {
-                R.id.modeRaw -> SmoothingMode.RAW
-                R.id.modeEMA -> SmoothingMode.EMA
-                R.id.modeFLK -> SmoothingMode.FLK
-                else -> SmoothingMode.RAW
-            }
-            processor.smoothingMode = mode // 내부에서 resetSmoothing() 호출됨
-
-            overlay.setEngineLabel(
-                when (mode) {
-                    SmoothingMode.RAW -> "MediaPipe (Raw)"
-                    SmoothingMode.EMA -> "MediaPipe (EMA)"
-                    SmoothingMode.FLK -> "MediaPipe (FLK)"
-                }
-            )
-        }
 
         ensurePerm()
     }
@@ -167,30 +139,24 @@ class MediaPipeRealtimeFragment : Fragment() {
                 .build().also { ia ->
                     ia.setAnalyzer(analyzerExecutor) { imageProxy ->
                         val tsNs = imageProxy.imageInfo.timestamp
-                        // 프레임 스로틀링(필요하다면 FpsGovernor에서 거부)
                         if (!fpsGov.shouldAccept(tsNs)) { imageProxy.close(); return@setAnalyzer }
 
-                        val rotDeg = imageProxy.imageInfo.rotationDegrees
-                        val srcW = if (rotDeg % 180 == 0) imageProxy.width else imageProxy.height
-                        val srcH = if (rotDeg % 180 == 0) imageProxy.height else imageProxy.width
+                        val rot = imageProxy.imageInfo.rotationDegrees
+                        val srcW = if (rot % 180 == 0) imageProxy.width  else imageProxy.height
+                        val srcH = if (rot % 180 == 0) imageProxy.height else imageProxy.width
                         overlay.setSourceSize(srcW, srcH)
 
                         processor.process(imageProxy)
                     }
                 }
 
-            val selector = CameraSelector.Builder()
-                .requireLensFacing(CameraSelector.LENS_FACING_FRONT)
-                .build()
+            val selector = CameraSelector.Builder().requireLensFacing(CameraSelector.LENS_FACING_FRONT).build()
 
-            // PreviewView 크기 준비 안됐으면 재시도
             if (previewView.width == 0 || previewView.height == 0) {
-                previewView.post { startCamera() }
-                return@addListener
+                previewView.post { startCamera() }; return@addListener
             }
             val vp = ViewPort.Builder(Rational(previewView.width, previewView.height), rotation)
-                .setScaleType(ViewPort.FILL_CENTER)
-                .build()
+                .setScaleType(ViewPort.FILL_CENTER).build()
 
             val group = UseCaseGroup.Builder()
                 .setViewPort(vp)
@@ -206,8 +172,6 @@ class MediaPipeRealtimeFragment : Fragment() {
 
     override fun onDestroyView() {
         super.onDestroyView()
-        try { analysis?.clearAnalyzer() } catch (_: Exception) {}
-        try { cameraProvider?.unbindAll() } catch (_: Exception) {}
         try { processor.close() } catch (_: Exception) {}
     }
 }

@@ -2,14 +2,18 @@
 package cc.ggrip.movenet.ui
 
 import android.content.Context
-import android.graphics.*
+import android.graphics.Canvas
+import android.graphics.Matrix
+import android.graphics.Paint
+import android.graphics.RectF
 import android.os.SystemClock
 import android.view.View
 import cc.ggrip.movenet.pose.PoseFrame
 import cc.ggrip.movenet.util.LatencyMeter
 import cc.ggrip.movenet.analysis.SwingPhaseAnalysis
 import cc.ggrip.movenet.analysis.GolfSwingPhase
-import kotlin.math.*
+import kotlin.math.max
+import kotlin.math.min
 
 class DotsOverlay(
     context: Context,
@@ -39,39 +43,6 @@ class DotsOverlay(
     @Volatile private var srcW: Int = 0
     @Volatile private var srcH: Int = 0
 
-    // 트레일 및 안정성 분석을 위한 히스토리
-    private val TRAIL_LENGTH = 30  // 최근 30프레임
-    private val STABILITY_WINDOW = 15  // 최근 15프레임 (0.5초 @ 30fps)
-    private val jointHistory = Array(33) { ArrayDeque<PointF>(TRAIL_LENGTH) }
-    private val jointStability = FloatArray(33)  // 각 관절의 표준편차
-
-    // 스무딩 성능 비교 지표
-    private var visibilityRate = 0f  // 관절 가시성 비율
-    private var smoothnessScore = 0f  // 움직임 부드러움 점수 (jerk 기반)
-    private var temporalCoherence = 0f  // 시간적 일관성
-    private var noiseReduction = 0f  // 노이즈 감소율
-
-    // 성능 측정용 버퍼
-    private val jerkHistory = ArrayDeque<Float>(30)  // jerk 값 히스토리
-    private var prevVelocity = PointF(0f, 0f)  // 이전 속도
-
-    // 성능 로그 기록
-    private var frameCount = 0L
-    private var lastSwingPhase: GolfSwingPhase? = null
-    private val performanceLog = mutableListOf<PerformanceRecord>()
-    private var sessionStartTime = System.currentTimeMillis()
-
-    data class PerformanceRecord(
-        val timestamp: Long,
-        val frameNumber: Long,
-        val smoothingMode: String,  // RAW, EMA, FLK
-        val swingPhase: GolfSwingPhase,
-        val visibilityRate: Float,
-        val smoothness: Float,
-        val coherence: Float,
-        val noiseReduction: Float
-    )
-
     fun setMirrorFlip(mirrorX: Boolean, flipY: Boolean) {
         this.mirrorX = mirrorX
         this.flipY = flipY
@@ -90,220 +61,7 @@ class DotsOverlay(
             firstFrameReceivedAtMs = f.frameReceivedTsMs
         }
         frame = f
-        frameCount++
-        updateHistory(f)  // 히스토리 업데이트
-        calculatePerformanceMetrics()   // 성능 지표 계산
-        logPerformanceIfNeeded()  // 성능 로그 기록
         postInvalidateOnAnimation()
-    }
-
-    private fun updateHistory(f: PoseFrame) {
-        val screen2d = f.screen2d
-        val n = screen2d.size / 2
-
-        for (i in 0 until minOf(n, 33)) {
-            val x = screen2d[i * 2]
-            val y = screen2d[i * 2 + 1]
-
-            // 화면 좌표로 변환 (미러링 적용)
-            val px = if (mirrorX) (1f - x) * width else x * width
-            val py = if (flipY) (1f - y) * height else y * height
-
-            val history = jointHistory[i]
-            if (history.size >= TRAIL_LENGTH) {
-                history.removeFirst()
-            }
-            history.addLast(PointF(px, py))
-
-            // 안정성 계산 (표준편차)
-            if (history.size >= STABILITY_WINDOW) {
-                val recent = history.takeLast(STABILITY_WINDOW)
-                val meanX = recent.map { it.x }.average().toFloat()
-                val meanY = recent.map { it.y }.average().toFloat()
-
-                val variance = recent.map { p ->
-                    val dx = p.x - meanX
-                    val dy = p.y - meanY
-                    dx * dx + dy * dy
-                }.average()
-
-                jointStability[i] = sqrt(variance.toFloat())
-            }
-        }
-    }
-
-    private fun calculatePerformanceMetrics() {
-        val f = frame ?: return
-        val wristIdx = 16  // RIGHT_WRIST
-
-        // 1. 관절 가시성 비율 (좌표 범위와 변화량 기반)
-        var visibleCount = 0
-        var stableCount = 0
-        val totalJoints = f.screen2d.size / 2
-
-        for (i in 0 until totalJoints) {
-            val x = f.screen2d[i * 2]
-            val y = f.screen2d[i * 2 + 1]
-
-            // 화면 내 위치 체크
-            if (x in 0.02f..0.98f && y in 0.02f..0.98f) {
-                visibleCount++
-
-                // 안정성 체크 (떨림이 적으면 실제로 감지된 것)
-                if (i < jointStability.size && jointStability[i] < 10f) {
-                    stableCount++
-                }
-            }
-        }
-
-        // 가시성 = (보이는 관절 + 안정적인 관절) / 2
-        visibilityRate = if (totalJoints > 0) {
-            (visibleCount.toFloat() / totalJoints * 0.5f +
-             stableCount.toFloat() / totalJoints * 0.5f)
-        } else 0f
-
-        // 2. 움직임 부드러움 (Jerk 기반 - 가속도의 변화율)
-        if (jointHistory[wristIdx].size >= 3) {
-            val history = jointHistory[wristIdx].takeLast(5).toList()
-
-            if (history.size >= 3) {
-                // 현재 속도 계산
-                val currVel = PointF(
-                    history.last().x - history[history.size - 2].x,
-                    history.last().y - history[history.size - 2].y
-                )
-
-                // Jerk = 가속도의 변화율 (속도 변화의 변화)
-                val jerk = sqrt(
-                    (currVel.x - prevVelocity.x) * (currVel.x - prevVelocity.x) +
-                    (currVel.y - prevVelocity.y) * (currVel.y - prevVelocity.y)
-                )
-
-                prevVelocity = currVel
-
-                // Jerk 히스토리 업데이트
-                if (jerkHistory.size >= 30) jerkHistory.removeFirst()
-                jerkHistory.addLast(jerk)
-
-                // 평균 Jerk가 낮을수록 부드러움
-                if (jerkHistory.size > 5) {
-                    val avgJerk = jerkHistory.average().toFloat()
-                    // Jerk를 0~1 범위로 정규화 (낮을수록 좋음)
-                    smoothnessScore = 1f / (1f + avgJerk * 0.1f)
-                }
-            }
-        }
-
-        // 3. 시간적 일관성 (프레임 간 위치 예측 정확도)
-        if (jointHistory[wristIdx].size >= 10) {
-            val history = jointHistory[wristIdx].takeLast(10).toList()
-            var coherenceSum = 0f
-
-            // 선형 예측과 실제 위치 비교
-            for (i in 2 until history.size) {
-                // i-2, i-1로 i를 예측
-                val predictedX = history[i-1].x + (history[i-1].x - history[i-2].x)
-                val predictedY = history[i-1].y + (history[i-1].y - history[i-2].y)
-
-                // 예측 오차
-                val error = sqrt(
-                    (predictedX - history[i].x) * (predictedX - history[i].x) +
-                    (predictedY - history[i].y) * (predictedY - history[i].y)
-                )
-
-                // 오차가 작을수록 일관성 높음
-                coherenceSum += 1f / (1f + error * 0.01f)
-            }
-
-            temporalCoherence = coherenceSum / (history.size - 2)
-        }
-
-        // 4. 노이즈 감소율 (신호 대 잡음비 개선)
-        val currentStability = jointStability[wristIdx]
-
-        // 안정성 점수를 노이즈 감소율로 변환
-        // 표준편차가 낮을수록 노이즈가 적음
-        noiseReduction = when {
-            currentStability < 3f -> 0.95f    // 매우 깨끗
-            currentStability < 6f -> 0.85f    // 깨끗
-            currentStability < 10f -> 0.70f   // 보통
-            currentStability < 15f -> 0.50f   // 노이즈 있음
-            else -> 0.30f                     // 노이즈 많음
-        }
-    }
-
-    private fun logPerformanceIfNeeded() {
-        val currentPhase = swingAnalysis?.phase ?: return
-        val mode = when {
-            engineLabel.contains("FLK", true) -> "FLK"
-            engineLabel.contains("EMA", true) -> "EMA"
-            engineLabel.contains("Raw", true) -> "RAW"
-            else -> "UNKNOWN"
-        }
-
-        // 스윙 단계가 변경되었거나 10프레임마다 로그
-        if (currentPhase != lastSwingPhase || frameCount % 10 == 0L) {
-            val record = PerformanceRecord(
-                timestamp = System.currentTimeMillis() - sessionStartTime,
-                frameNumber = frameCount,
-                smoothingMode = mode,
-                swingPhase = currentPhase,
-                visibilityRate = visibilityRate,
-                smoothness = smoothnessScore,
-                coherence = temporalCoherence,
-                noiseReduction = noiseReduction
-            )
-
-            performanceLog.add(record)
-
-            // 콘솔 로그 출력
-            android.util.Log.d("PerfMetrics",
-                String.format("%s | %s | Vis:%.1f%% | Smooth:%.1f%% | Coh:%.1f%% | Noise:%.1f%%",
-                    mode.padEnd(3),
-                    currentPhase.name.padEnd(14),
-                    visibilityRate * 100,
-                    smoothnessScore * 100,
-                    temporalCoherence * 100,
-                    noiseReduction * 100
-                )
-            )
-
-            // 스윙 단계 변경 시 요약 출력
-            if (currentPhase != lastSwingPhase && lastSwingPhase != null) {
-                val phaseRecords = performanceLog.filter {
-                    it.swingPhase == lastSwingPhase && it.smoothingMode == mode
-                }
-
-                if (phaseRecords.isNotEmpty()) {
-                    val avgSmooth = phaseRecords.map { it.smoothness }.average() * 100
-                    val minSmooth = phaseRecords.minOf { it.smoothness } * 100
-                    val maxSmooth = phaseRecords.maxOf { it.smoothness } * 100
-
-                    android.util.Log.i("PerfSummary",
-                        String.format("%s | %s 완료 | 부드러움: 평균 %.1f%% (최소 %.1f%% ~ 최대 %.1f%%)",
-                            mode, lastSwingPhase?.name,
-                            avgSmooth, minSmooth, maxSmooth
-                        )
-                    )
-                }
-            }
-
-            lastSwingPhase = currentPhase
-        }
-    }
-
-    // CSV 내보내기 메소드 (필요시 호출)
-    fun exportPerformanceLog(): String {
-        val csv = StringBuilder()
-        csv.appendLine("Timestamp,Frame,Mode,Phase,Visibility%,Smoothness%,Coherence%,NoiseReduction%")
-
-        performanceLog.forEach { record ->
-            csv.appendLine("${record.timestamp},${record.frameNumber},${record.smoothingMode}," +
-                "${record.swingPhase.name},${record.visibilityRate * 100}," +
-                "${record.smoothness * 100},${record.coherence * 100},${record.noiseReduction * 100}")
-        }
-
-        return csv.toString()
     }
     private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = 0xFFFFCC00.toInt()
@@ -317,27 +75,6 @@ class DotsOverlay(
     private val boxPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = 0x66000000
         style = Paint.Style.FILL
-    }
-
-    // 트레일 페인트
-    private val trailPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeWidth = 2f
-        strokeCap = Paint.Cap.ROUND
-    }
-
-    // 안정성 링 페인트
-    private val stabilityPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeWidth = 3f
-        color = 0x80FFFFFF.toInt()
-    }
-
-    // KPI 텍스트 페인트
-    private val kpiPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = 0xFFFFFF00.toInt()
-        textSize = 28f
-        typeface = Typeface.MONOSPACE
     }
 
     // 스윙 상태 신호등 UI를 위한 페인트
@@ -389,28 +126,14 @@ class DotsOverlay(
                 }
             }
 
-            // 트레일 그리기 (키포인트 그리기 전에)
-            drawTrails(canvas)
-
-            // 키포인트 및 안정성 링 그리기
+            // 키포인트 그리기
             val p = f.screen2d
             val n = p.size / 2  // 17(MoveNet) 또는 33(MediaPipe) 등
             val tmp = FloatArray(2)
-
-            // 주요 관절 인덱스
-            val keyJoints = listOf(15, 16)  // LEFT_WRIST, RIGHT_WRIST
-
             for (i in 0 until n) {
                 tmp[0] = p[i * 2]
                 tmp[1] = p[i * 2 + 1]
                 m.mapPoints(tmp)
-
-                // 안정성 링 그리기 (손목만)
-                if (i in keyJoints && i < jointStability.size) {
-                    drawStabilityRing(canvas, tmp[0], tmp[1], jointStability[i])
-                }
-
-                // 키포인트 점 그리기
                 canvas.drawCircle(tmp[0], tmp[1], 10f, dotPaint)
             }
 
@@ -441,9 +164,6 @@ class DotsOverlay(
 
             // 스윙 상태 신호등 그리기
             drawSwingStateIndicator(canvas, W, swingAnalysis)
-
-            // 성능 지표 패널 그리기
-            drawPerformanceMetrics(canvas)
 
             val lines = listOf(
                 "$engineLabel • $modelLabel • 목표 ${"%.0f".format(targetFps)} FPS",
@@ -481,140 +201,6 @@ class DotsOverlay(
                 yText += hudPaint.textSize
             }
 
-        }
-    }
-
-    private fun drawTrails(canvas: Canvas) {
-        // 손목 관절만 트레일 표시 (15: LEFT_WRIST, 16: RIGHT_WRIST)
-        val wristIndices = listOf(15, 16)
-
-        for (idx in wristIndices) {
-            if (idx >= jointHistory.size) continue
-            val history = jointHistory[idx]
-            if (history.size < 2) continue
-
-            val path = Path()
-            var first = true
-
-            // 트레일 그라데이션 효과
-            history.forEachIndexed { i, point ->
-                val alpha = (i.toFloat() / history.size * 255).toInt()
-                trailPaint.alpha = alpha
-
-                // 스무딩 정도에 따라 색상 변경
-                val stability = if (idx < jointStability.size) jointStability[idx] else 0f
-                trailPaint.color = when {
-                    stability < 5f -> 0xFF00FF00.toInt()   // 안정적: 녹색
-                    stability < 15f -> 0xFFFFFF00.toInt()  // 보통: 노란색
-                    else -> 0xFFFF4444.toInt()             // 불안정: 빨간색
-                }
-
-                // 안정성에 따라 선 두께 조절
-                trailPaint.strokeWidth = when {
-                    stability < 5f -> 1.5f   // 얇은 선
-                    stability < 15f -> 3f    // 중간
-                    else -> 5f               // 두꺼운 선
-                }
-
-                if (first) {
-                    path.moveTo(point.x, point.y)
-                    first = false
-                } else {
-                    path.lineTo(point.x, point.y)
-                }
-
-                if (i > 0) {
-                    val prevPoint = history.elementAt(i - 1)
-                    canvas.drawLine(prevPoint.x, prevPoint.y, point.x, point.y, trailPaint)
-                }
-            }
-        }
-    }
-
-    private fun drawStabilityRing(canvas: Canvas, x: Float, y: Float, stability: Float) {
-        // 안정성 수치에 따른 링 색상
-        stabilityPaint.color = when {
-            stability < 5f -> 0x8000FF00.toInt()   // 안정: 녹색
-            stability < 15f -> 0x80FFFF00.toInt()  // 보통: 노란색
-            else -> 0x80FF4444.toInt()             // 불안정: 빨간색
-        }
-
-        // 링 크기는 안정성에 반비례
-        val radius = when {
-            stability < 5f -> 20f    // 작은 링 = 안정적
-            stability < 15f -> 30f   // 중간 링
-            else -> 40f              // 큰 링 = 불안정
-        }
-
-        // 링 두께도 안정성에 따라
-        stabilityPaint.strokeWidth = when {
-            stability < 5f -> 2f
-            stability < 15f -> 3f
-            else -> 4f
-        }
-
-        canvas.drawCircle(x, y, radius, stabilityPaint)
-
-        // 안정성 수치 텍스트 (디버그용, 선택적)
-        if (stability > 15f) {  // 불안정할 때만 수치 표시
-            val textPaint = Paint(kpiPaint).apply {
-                textSize = 16f
-                color = 0xFFFF4444.toInt()
-            }
-            canvas.drawText("%.1f".format(stability), x + radius + 5, y, textPaint)
-        }
-    }
-
-    private fun drawPerformanceMetrics(canvas: Canvas) {
-        // 성능 지표를 화면 우측 상단에 표시
-        val x = width - 320f
-        val y = 30f
-        val lineHeight = 35f
-
-        // 배경 박스
-        val bgPaint = Paint().apply {
-            color = 0xBB000000.toInt()
-            style = Paint.Style.FILL
-        }
-        canvas.drawRoundRect(x - 10, y - 10, width - 16f, y + lineHeight * 5 + 10, 14f, 14f, bgPaint)
-
-        // 제목
-        val titlePaint = Paint(kpiPaint).apply {
-            textSize = 24f
-            color = 0xFFFFCC00.toInt()
-            isFakeBoldText = true
-        }
-        canvas.drawText("스무딩 효과 (실험적)", x, y + 15, titlePaint)
-
-        // 지표 텍스트
-        val metrics = listOf(
-            "관절 감지율: %.1f%%".format(visibilityRate * 100),
-            "움직임 부드러움: %.1f%%".format(smoothnessScore * 100),
-            "시간적 일관성: %.1f%%".format(temporalCoherence * 100),
-            "노이즈 감소: %.1f%%".format(noiseReduction * 100)
-        )
-
-        val metricPaint = Paint(kpiPaint).apply {
-            textSize = 22f
-        }
-
-        metrics.forEachIndexed { i, text ->
-            // 각 지표에 따른 색상 설정
-            val value = when(i) {
-                0 -> visibilityRate
-                1 -> smoothnessScore
-                2 -> temporalCoherence
-                3 -> noiseReduction
-                else -> 0f
-            }
-
-            metricPaint.color = when {
-                value > 0.8f -> 0xFF00FF00.toInt()  // 녹색: 우수
-                value > 0.5f -> 0xFFFFFF00.toInt()  // 노란색: 보통
-                else -> 0xFFFF6666.toInt()          // 빨간색: 개선 필요
-            }
-
-            canvas.drawText(text, x, y + 50 + lineHeight * i, metricPaint)
         }
     }
 
